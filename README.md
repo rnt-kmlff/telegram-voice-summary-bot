@@ -1,6 +1,6 @@
 # Telegram Voice Summary Bot
 
-Forward an English or Russian voice message to your own Telegram bot. Get the key excerpts and a button for the full transcript. Speech recognition and summary selection run on your Mac with **Whisper + Qwen3.5**.
+Forward an English or Russian voice message to your own Telegram bot. Get a concise summary and a button for the full transcript. Speech recognition and summarization run on your Mac with **Whisper + Qwen3.5**.
 
 ```mermaid
 flowchart LR
@@ -15,14 +15,14 @@ flowchart LR
 
 - English/Russian voice notes and audio files, up to five minutes and 20 MB.
 - Private chats restricted to an explicit user allowlist.
-- Local Apple Silicon speech recognition, with Qwen3.5 4B for summaries.
-- Default summaries select source excerpts, preserving the transcript's wording. Explicitly requested translations are labeled as machine translations.
+- Local Apple Silicon speech recognition, with Qwen3.5 9B for summaries.
+- Summaries condense the whole transcript with controlled rephrasing, removing filler and repetition. Explicitly requested translations are labeled as machine translations.
 - A durable SQLite queue, one inference job at a time, and duplicate detection.
 - Summary language selection, transcript download and temporary-audio cleanup.
 - A standalone text-summary command that other local tools can reuse.
 - Offline automated tests and GitHub Actions checks.
 
-This is an initial personal-use release. Model accuracy depends on the recording. Source excerpts prevent invented paraphrases, but transcription can still be wrong and selection can omit context. Check names, numbers, dates and commitments against the audio. AI processing runs locally; the audio and returned text still travel through Telegram. There is no cloud AI fallback.
+This is an initial personal-use release. The system prompt asks Qwen to preserve names, amounts, negation, speaker commitments and pending decisions. A length check prevents most of a long transcript being returned as its summary. Neither is a guarantee of factual accuracy: speech recognition and rephrasing can introduce errors. Check important details against the full transcript and audio. AI processing runs locally; the audio and returned text still travel through Telegram. There is no cloud AI fallback.
 
 ## macOS setup
 
@@ -40,7 +40,7 @@ ollama serve
 Leave Ollama running. In another terminal in this directory:
 
 ```sh
-ollama pull qwen3.5:4b
+ollama pull qwen3.5:9b
 cp .env.example .env
 chmod 600 .env
 ```
@@ -71,14 +71,14 @@ bash scripts/download-whisper.sh small
 WHISPER_MODEL_PATH=models/ggml-small.bin uv run voice-summary process recording.ogg
 ```
 
-The default summary model is [`qwen3.5:4b`](https://ollama.com/library/qwen3.5:4b), served on `127.0.0.1:11434`. Both the URL and selected model are checked to keep inference local. The same Ollama installation and model can be reused by other applications. Keep requests modest on machines with limited memory; this bot runs speech recognition and summarization sequentially.
+The default summary model is [`qwen3.5:9b`](https://ollama.com/library/qwen3.5:9b), served on `127.0.0.1:11434`. Both the URL and selected model are checked to keep inference local. The same Ollama installation and model can be reused by other applications. Keep requests modest on machines with limited memory; this bot runs speech recognition and summarization sequentially. The smaller `qwen3.5:4b` remains configurable through `OLLAMA_MODEL`, but showed more factual changes in the initial rephrasing trials.
 
 ## Using the bot
 
-Forward or send a voice message or audio file in a private chat. The bot acknowledges receipt, then updates that message with key source excerpts. **Full transcript** returns a text file with the complete summary and original transcript. Quoted first-person statements belong to the recording's speaker.
+Forward or send a voice message or audio file in a private chat. The bot acknowledges receipt, then updates that message with a short paragraph covering the main point and important requests or qualifications. **Full transcript** returns a text file with the complete summary and original transcript. Previously cached excerpt-style replies remain labeled as excerpts until replaced or expired.
 
 - `/start` or `/help`: brief instructions.
-- `/language auto`, `/language en`, `/language ru`: choose the summary language. `auto` follows the source language and preserves its wording. Requesting a different language adds a separate machine-translation step, which needs review against the original transcript.
+- `/language auto`, `/language en`, `/language ru`: choose the summary language. `auto` follows the source language. A summary requested in a different language is labeled as machine-translated and should be checked against the original transcript.
 - `/status`: number of pending messages.
 
 If processing fails, forward the message again to retry. If only summarization fails, the available transcript remains accessible. This initial version does not ingest chat histories, join groups, send messages to other people, or execute instructions spoken in a recording.

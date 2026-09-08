@@ -89,14 +89,19 @@ def transcript_button(job_id: str) -> InlineKeyboardMarkup:
 def render_summary(summary: Summary, language: str = "en", *, preview: bool = True) -> str:
     russian = language == "ru"
     translated = getattr(summary, "translated", False)
+    abstractive = getattr(summary, "mode", "extractive") == "abstractive"
     heading = (
         ("Машинный перевод резюме:" if russian else "Machine-translated summary:")
         if translated
-        else ("Главное из сообщения:" if russian else "Key excerpts from the recording:")
+        else (
+            ("Кратко:" if russian else "Summary:")
+            if abstractive
+            else ("Главное из сообщения:" if russian else "Key excerpts from the recording:")
+        )
     )
 
     def display(text: str) -> str:
-        return text if translated else f"“{text}”"
+        return text if translated or abstractive else f"“{text}”"
 
     lines = [heading, display(summary.overview)]
     if summary.key_points:

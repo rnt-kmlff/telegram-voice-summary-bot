@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -143,6 +144,76 @@ def test_summary_stays_within_telegram_utf16_limit():
         uncertainties=["😀" * 400] * 5,
     )
     assert len(render_summary(summary).encode("utf-16-le")) // 2 <= 3600
+
+
+@pytest.mark.parametrize("language,heading", [("en", "Summary:"), ("ru", "Кратко:")])
+def test_abstractive_json_renders_as_unquoted_summary(language, heading):
+    summary = Summary.model_validate_json(
+        json.dumps(
+            {
+                "overview": "Approval is pending.",
+                "key_points": ["The proposed cost is $12,500."],
+                "actions": ["The speaker will confirm the inspection date tomorrow."],
+                "uncertainties": ["The inspection date is unknown."],
+                "mode": "abstractive",
+            }
+        )
+    )
+    text = render_summary(summary, language)
+    assert text.startswith(f"{heading}\nApproval is pending.\n")
+    assert "• The proposed cost is $12,500." in text
+    assert "• The speaker will confirm the inspection date tomorrow." in text
+    assert "• The inspection date is unknown." in text
+    assert "“" not in text and "”" not in text
+
+
+def test_legacy_cached_json_keeps_excerpt_label_and_quotes():
+    summary = Summary.model_validate_json(
+        '{"overview":"I will confirm tomorrow.","key_points":[],"actions":[],"uncertainties":[]}'
+    )
+    assert summary.mode == "extractive"
+    assert render_summary(summary) == (
+        "Key excerpts from the recording:\n“I will confirm tomorrow.”"
+    )
+
+
+@pytest.mark.parametrize("mode", ["abstractive", "extractive"])
+@pytest.mark.parametrize(
+    "language,heading",
+    [("en", "Machine-translated summary:"), ("ru", "Машинный перевод резюме:")],
+)
+def test_translated_json_remains_labeled_and_unquoted(mode, language, heading):
+    summary = Summary.model_validate_json(
+        json.dumps(
+            {
+                "overview": "Approval is pending.",
+                "key_points": [],
+                "actions": [],
+                "uncertainties": [],
+                "mode": mode,
+                "translated": True,
+            }
+        )
+    )
+    assert render_summary(summary, language) == f"{heading}\nApproval is pending."
+
+
+@pytest.mark.parametrize("mode", ["abstractive", "extractive"])
+def test_long_summary_preview_keeps_complete_overview_and_download_keeps_all_text(mode):
+    point = "A lengthy detail. " * 90
+    summary = Summary(
+        overview="Approval is pending; do not start work yet.",
+        key_points=[point, point, point],
+        actions=[],
+        uncertainties=[],
+        mode=mode,
+    )
+    preview = render_summary(summary)
+    assert summary.overview in preview
+    assert "Full transcript" in preview
+    assert point not in preview
+    assert len(preview.encode("utf-16-le")) // 2 <= 3600
+    assert render_summary(summary, preview=False).count(point.strip()) == 3
 
 
 def test_second_poller_lock_is_rejected(tmp_path: Path):

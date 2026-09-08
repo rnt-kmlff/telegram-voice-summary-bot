@@ -37,7 +37,7 @@ class Settings:
     ffmpeg_binary: str = "ffmpeg"
     whisper_language: str = "auto"
     ollama_base_url: str = "http://127.0.0.1:11434"
-    ollama_model: str = "qwen3.5:4b"
+    ollama_model: str = "qwen3.5:9b"
     summary_language: str = "auto"
     data_dir: Path = Path("data")
     max_duration: int = 300
@@ -65,7 +65,7 @@ class Settings:
             ffmpeg_binary=os.getenv("FFMPEG_BINARY", "ffmpeg"),
             whisper_language=language("WHISPER_LANGUAGE"),
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
-            ollama_model=os.getenv("OLLAMA_MODEL", "qwen3.5:4b"),
+            ollama_model=os.getenv("OLLAMA_MODEL", "qwen3.5:9b"),
             summary_language=language("SUMMARY_LANGUAGE"),
             data_dir=Path(os.getenv("DATA_DIR", "data")).expanduser().resolve(),
             max_duration=positive_int("MAX_DURATION_SECONDS", 300, 300),
