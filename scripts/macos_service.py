@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from voice_summary_bot.config import ConfigurationError, Settings
@@ -120,6 +121,23 @@ def _bootout(service: str) -> None:
         raise ServiceError("The previous service could not be stopped; no replacement was started.")
 
 
+def _bootstrap(domain: str, destination: Path, *, reinstall: bool) -> None:
+    # launchd can briefly return I/O error after a successful bootout while it
+    # finishes releasing the old service. Retry that case without another stop.
+    attempts = 4 if reinstall else 1
+    for attempt in range(attempts):
+        result = run_launchctl("bootstrap", domain, str(destination), check=False)
+        if result.returncode == 0:
+            return
+        if result.returncode == 5 and attempt + 1 < attempts:
+            time.sleep(5)
+            continue
+        raise ServiceError(
+            f"The macOS service operation failed (exit {result.returncode}). "
+            "Check that you are signed into the desktop, then retry."
+        )
+
+
 def _private_log(repo: Path) -> None:
     directory = repo / "data"
     if directory.is_symlink():
@@ -154,13 +172,22 @@ def install(repo: Path, agents_directory: Path) -> None:
     _private_log(repo)
     domain = f"gui/{os.getuid()}"
     service = f"{domain}/{LABEL}"
+    if previous == definition and run_launchctl("print", service, check=False).returncode == 0:
+        # Code and .env changes need a process restart, not a service replacement.
+        # Keep the loaded definition to avoid launchd's delayed bootout cleanup.
+        destination.chmod(0o600)
+        run_launchctl("enable", service)
+        run_launchctl("kickstart", "-k", service)
+        print("Bot login service restarted with this checkout's current configuration.")
+        status(repo, agents_directory)
+        return
     if previous is not None:
         _bootout(service)
     _write_plist(destination, definition)
     # Enable first: a previously disabled label must be eligible for RunAtLoad
     # when it is bootstrapped. No token or user ID is passed to launchd.
     run_launchctl("enable", service)
-    run_launchctl("bootstrap", domain, str(destination))
+    _bootstrap(domain, destination, reinstall=previous is not None)
     print("Bot login service installed. It starts at login and restarts after exit.")
     status(repo, agents_directory)
 
