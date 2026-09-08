@@ -40,7 +40,7 @@ class Settings:
     ollama_model: str = "qwen3.5:9b"
     summary_language: str = "auto"
     data_dir: Path = Path("data")
-    max_duration: int = 300
+    max_duration: int = 600
     max_file_bytes: int = 20_000_000
     max_pending_jobs: int = 10
     ttl_hours: int = 24
@@ -68,7 +68,7 @@ class Settings:
             ollama_model=os.getenv("OLLAMA_MODEL", "qwen3.5:9b"),
             summary_language=language("SUMMARY_LANGUAGE"),
             data_dir=Path(os.getenv("DATA_DIR", "data")).expanduser().resolve(),
-            max_duration=positive_int("MAX_DURATION_SECONDS", 300, 300),
+            max_duration=positive_int("MAX_DURATION_SECONDS", 600, 600),
             max_file_bytes=positive_int("MAX_FILE_BYTES", 20_000_000, 20_000_000),
             max_pending_jobs=positive_int("MAX_PENDING_JOBS", 10, 100),
             ttl_hours=positive_int("TRANSCRIPT_TTL_HOURS", 24, 168),

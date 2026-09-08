@@ -13,6 +13,7 @@ import pytest
 
 from voice_summary_bot import inference
 from voice_summary_bot.inference import (
+    AudioDurationError,
     InferenceError,
     OllamaSummarizer,
     Summary,
@@ -88,7 +89,7 @@ def test_whisper_uses_native_json_schema_and_cleans_temporary_files(
     assert transcript == Transcript("Встреча в пятницу. Подтверди, пожалуйста.", "ru")
     ffmpeg_args = calls[0][0]
     assert ffmpeg_args[ffmpeg_args.index("-i") + 1] == str(source)
-    assert ffmpeg_args[ffmpeg_args.index("-t") + 1] == "301"
+    assert ffmpeg_args[ffmpeg_args.index("-t") + 1] == "601"
     assert ffmpeg_args[ffmpeg_args.index("-protocol_whitelist") + 1] == "file,pipe"
     whisper_args = calls[1][0]
     assert whisper_args[whisper_args.index("-l") + 1] == "auto"
@@ -136,6 +137,69 @@ def test_rejects_decoded_long_or_silent_audio_before_whisper(
     with pytest.raises(InferenceError, match=message):
         asyncio.run(WhisperTranscriber(model, max_duration=1).transcribe(source))
     assert calls == ["ffmpeg"]
+
+
+@pytest.mark.parametrize("limit", [300, 600])
+def test_decoded_duration_includes_exact_limit_but_rejects_extra_frame(tmp_path, limit):
+    path = tmp_path / "boundary.wav"
+    _write_wav(path, duration=limit)
+    inference._check_wav(path, limit)
+    with wave.open(str(path), "wb") as audio:
+        audio.setparams((1, 2, 16_000, 0, "NONE", "not compressed"))
+        audio.writeframes(b"\xe8\x03" * (limit * 16_000 + 1))
+    with pytest.raises(AudioDurationError, match=f"{limit}-second"):
+        inference._check_wav(path, limit)
+
+
+def test_per_recording_limit_does_not_change_shared_transcriber(tmp_path, monkeypatch):
+    source = tmp_path / "source.ogg"
+    model = tmp_path / "model.bin"
+    source.touch()
+    model.touch()
+    calls = []
+
+    async def fake_process(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "ffmpeg":
+            _write_wav(Path(args[-1]), duration=301)
+        else:
+            prefix = Path(args[args.index("-of") + 1])
+            prefix.with_suffix(".json").write_text(
+                json.dumps({"transcription": [{"text": "Complete recording."}]})
+            )
+
+    monkeypatch.setattr(inference, "_run_process", fake_process)
+    transcriber = WhisperTranscriber(model, max_duration=600)
+    with pytest.raises(AudioDurationError):
+        asyncio.run(transcriber.transcribe(source, max_duration=300))
+    assert [args[0] for args in calls] == ["ffmpeg"]
+    assert calls[0][calls[0].index("-t") + 1] == "301"
+    result = asyncio.run(transcriber.transcribe(source, max_duration=600))
+    assert result.text == "Complete recording."
+    assert calls[1][calls[1].index("-t") + 1] == "601"
+    assert transcriber.max_duration == 600
+
+
+@pytest.mark.parametrize("limit", [0, -1, 601, True, 300.0, "300"])
+def test_invalid_recording_limit_rejected_before_processing(tmp_path, monkeypatch, limit):
+    runner = AsyncMock()
+    monkeypatch.setattr(inference, "_run_process", runner)
+    with pytest.raises(InferenceError, match="configured limit"):
+        asyncio.run(
+            WhisperTranscriber(tmp_path / "model").transcribe(
+                tmp_path / "recording", max_duration=limit
+            )
+        )
+    runner.assert_not_called()
+
+
+def test_recording_override_cannot_raise_deployment_ceiling(tmp_path):
+    with pytest.raises(InferenceError, match="configured limit"):
+        asyncio.run(
+            WhisperTranscriber(tmp_path / "model", max_duration=300).transcribe(
+                tmp_path / "recording", max_duration=600
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -296,8 +360,8 @@ def test_summary_protocol_sends_entire_source_as_data_and_returns_abstractive_mo
     assert payload["stream"] is False and payload["think"] is False
     assert payload["truncate"] is False and payload["shift"] is False
     assert payload["options"] == {
-        "num_ctx": 8192,
-        "num_predict": 768,
+        "num_ctx": 16384,
+        "num_predict": 1536,
         "temperature": 0,
         "presence_penalty": 0,
         "repeat_penalty": 1.0,
@@ -339,7 +403,7 @@ def test_cloud_alias_is_rejected_before_transcript_is_sent():
     [
         (_chat_result(done=False), "incomplete"),
         (_chat_result(done_reason="length"), "incomplete"),
-        (_chat_result(prompt_eval_count=8000), "context"),
+        (_chat_result(prompt_eval_count=16384 - 1536), "context"),
         (_chat_result(message={"content": "{broken"}), "invalid summary"),
         (
             _chat_result(message={"content": json.dumps(_valid_summary(key_points=["Fact"]))}),
@@ -391,7 +455,7 @@ def test_saved_summary_without_mode_remains_extractive():
 
 
 def test_long_unpunctuated_transcript_reaches_model_in_full():
-    text = "Please review " + "this clause and " * 80 + "do not approve it yet"
+    text = "Please review " + "this clause and " * 1400 + "do not approve it yet"
     calls = []
 
     def respond(request):
@@ -548,7 +612,9 @@ def test_generation_cannot_forge_renderer_mode_or_translation_flag():
     assert chat_count == 1
 
 
-@pytest.mark.parametrize("word_count,expected", [(8, 4), (40, 20), (60, 25), (200, 60), (600, 120)])
+@pytest.mark.parametrize(
+    "word_count,expected", [(8, 4), (40, 20), (60, 25), (200, 60), (600, 120), (1500, 220)]
+)
 def test_requested_word_budget_scales_with_full_transcript(word_count, expected):
     requests = []
 
@@ -600,7 +666,7 @@ def test_oversize_transcript_is_rejected_without_model_call():
         summarizer = OllamaSummarizer(transport=httpx.MockTransport(respond))
         try:
             with pytest.raises(InferenceError, match="too long"):
-                await summarizer.summarize(Transcript("x" * 16_001))
+                await summarizer.summarize(Transcript("x" * 32_001))
         finally:
             await summarizer.close()
 

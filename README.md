@@ -13,7 +13,7 @@ flowchart LR
 
 ## What is included
 
-- English/Russian voice notes and audio files, up to five minutes and 20 MB.
+- English/Russian voice notes and audio files, up to ten minutes and 20 MB.
 - Private chats restricted to an explicit user allowlist.
 - Local Apple Silicon speech recognition, with Qwen3.5 9B for summaries.
 - Summaries condense the whole transcript with controlled rephrasing, removing filler and repetition. Explicitly requested translations are labeled as machine translations.
@@ -79,7 +79,12 @@ Forward or send a voice message or audio file in a private chat. The bot acknowl
 
 - `/start` or `/help`: brief instructions.
 - `/language auto`, `/language en`, `/language ru`: choose the summary language. `auto` follows the source language. A summary requested in a different language is labeled as machine-translated and should be checked against the original transcript.
-- `/status`: number of pending messages.
+- `/limit`: show your recording limit and buttons for **5 minutes** or **10 minutes**. `/limit 5` and `/limit 10` also work. The choice is saved per user across restarts; the default is ten minutes.
+- `/status`: number of pending messages and your recording limit.
+
+Changing the limit affects future recordings. Already queued recordings retain the limit accepted when they were sent. Both Telegram's reported duration and the decoded audio are checked; over-limit audio is rejected rather than silently cut short. The 20 MB download cap still applies. Longer recordings take more processing time and hold up later jobs in the single queue.
+
+`MAX_DURATION_SECONDS` sets the deployment ceiling and default (600 seconds). An operator can lower it to 300 seconds to disable ten-minute selection. A deployment ceiling also applies to older queued jobs. Qwen has a 16,384-token context and accepts transcripts up to 32,000 characters; a transcript that exceeds either safeguard remains available through the full-transcript fallback.
 
 If processing fails, forward the message again to retry. If only summarization fails, the available transcript remains accessible. This initial version does not ingest chat histories, join groups, send messages to other people, or execute instructions spoken in a recording.
 

@@ -28,6 +28,7 @@ class Job:
     summary_json: str | None = field(repr=False)
     language: str | None
     created_at: float
+    duration_limit: int = 300
 
 
 class Store:
@@ -84,6 +85,8 @@ class Store:
                     language TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
+                    duration_limit INTEGER NOT NULL DEFAULT 300
+                        CHECK (duration_limit BETWEEN 1 AND 600),
                     UNIQUE (user_id, file_unique_id)
                 );
                 CREATE INDEX IF NOT EXISTS jobs_pending ON jobs (state, created_at);
@@ -92,8 +95,24 @@ class Store:
                     user_id INTEGER PRIMARY KEY,
                     language TEXT NOT NULL CHECK (language IN ('auto', 'en', 'ru'))
                 );
+                CREATE TABLE IF NOT EXISTS duration_preferences (
+                    user_id INTEGER PRIMARY KEY,
+                    duration_limit INTEGER NOT NULL CHECK (duration_limit IN (300, 600))
+                );
                 """
             )
+            # Preserve the original five-minute allowance for jobs already queued
+            # before duration preferences were introduced. Lock the schema check
+            # and migration together so simultaneous openers cannot add it twice.
+            with self._transaction():
+                columns = {
+                    row["name"] for row in self._connection.execute("PRAGMA table_info(jobs)")
+                }
+                if "duration_limit" not in columns:
+                    self._connection.execute(
+                        "ALTER TABLE jobs ADD COLUMN duration_limit INTEGER NOT NULL "
+                        "DEFAULT 300 CHECK (duration_limit BETWEEN 1 AND 600)"
+                    )
             self._private_files()
             self.purge()
         except BaseException:
@@ -167,6 +186,23 @@ class Store:
             (user_id, language),
         )
 
+    def get_duration_limit(self, user_id: int, default: int = 600) -> int:
+        self._maybe_purge()
+        row = self._connection.execute(
+            "SELECT duration_limit FROM duration_preferences WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return row["duration_limit"] if row else default
+
+    def set_duration_limit(self, user_id: int, duration_limit: int) -> None:
+        if type(duration_limit) is not int or duration_limit not in {300, 600}:
+            raise ValueError("duration_limit must be 300 or 600 seconds.")
+        self._maybe_purge()
+        self._connection.execute(
+            "INSERT INTO duration_preferences (user_id, duration_limit) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET duration_limit = excluded.duration_limit",
+            (user_id, duration_limit),
+        )
+
     def enqueue(
         self,
         user_id: int,
@@ -176,14 +212,17 @@ class Store:
         file_unique_id: str,
         status_message_id: int,
         max_pending: int = 10,
+        duration_limit: int = 300,
     ) -> tuple[Job, bool]:
         """Return the job and whether a new record was created.
 
-        Failed duplicates are requeued with fresh message IDs and return False.
-        Existing queued, processing and completed duplicates stay unchanged.
+        Failed duplicates are requeued with fresh message IDs and duration limit,
+        and return False. Other duplicates retain their original allowance.
         """
         if max_pending < 1:
             raise ValueError("max_pending must be positive.")
+        if type(duration_limit) is not int or not 1 <= duration_limit <= 600:
+            raise ValueError("duration_limit must be an integer between 1 and 600 seconds.")
         # Also expires a duplicate immediately, even between periodic purges.
         self.purge()
         with self._transaction():
@@ -201,17 +240,27 @@ class Store:
                 self._connection.execute(
                     "UPDATE jobs SET chat_id = ?, message_id = ?, file_id = ?, "
                     "status_message_id = ?, state = 'queued', transcript = NULL, "
-                    "summary_json = NULL, language = NULL, created_at = ?, updated_at = ? "
+                    "summary_json = NULL, language = NULL, created_at = ?, updated_at = ?, "
+                    "duration_limit = ? "
                     "WHERE id = ?",
-                    (chat_id, message_id, file_id, status_message_id, now, now, existing.id),
+                    (
+                        chat_id,
+                        message_id,
+                        file_id,
+                        status_message_id,
+                        now,
+                        now,
+                        duration_limit,
+                        existing.id,
+                    ),
                 )
                 job_id = existing.id
             else:
                 job_id = uuid.uuid4().hex
                 self._connection.execute(
                     "INSERT INTO jobs (id, user_id, chat_id, message_id, file_id, "
-                    "file_unique_id, status_message_id, state, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+                    "file_unique_id, status_message_id, state, created_at, updated_at, "
+                    "duration_limit) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
                     (
                         job_id,
                         user_id,
@@ -222,6 +271,7 @@ class Store:
                         status_message_id,
                         now,
                         now,
+                        duration_limit,
                     ),
                 )
             created = self._job(

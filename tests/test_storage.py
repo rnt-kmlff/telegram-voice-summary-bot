@@ -250,6 +250,197 @@ def test_preferences_are_isolated_and_validated(store: Store):
         store.set_language(123, "de")
 
 
+def test_duration_preferences_are_independent_and_survive_restart(tmp_path: Path, clock: Clock):
+    directory = tmp_path / "data"
+    original = Store(directory, clock=clock)
+    try:
+        assert original.get_duration_limit(123) == 600
+        assert original.get_duration_limit(123, default=300) == 300
+        original.set_duration_limit(123, 300)
+        original.set_language(123, "ru")
+        original.set_duration_limit(456, 600)
+        assert original.get_language(456) == "auto"
+        original.set_language(456, "en")
+        assert original.get_duration_limit(456, default=300) == 600
+        original.set_duration_limit(123, 600)
+        assert original.get_language(123) == "ru"
+    finally:
+        original.close()
+
+    restarted = Store(directory, clock=clock)
+    try:
+        assert restarted.get_duration_limit(123, default=300) == 600
+        assert restarted.get_language(123) == "ru"
+        assert restarted.get_duration_limit(456, default=300) == 600
+        assert restarted.get_language(456) == "en"
+        restarted.set_duration_limit(456, 300)
+        assert restarted.get_duration_limit(123) == 600
+        assert restarted.get_duration_limit(456) == 300
+        assert restarted.get_duration_limit(789) == 600
+    finally:
+        restarted.close()
+
+
+@pytest.mark.parametrize("invalid", [True, False, None, "300", 300.0, 0, 299, 301, 601])
+def test_duration_preference_rejects_invalid_values_without_changing_setting(store: Store, invalid):
+    store.set_duration_limit(123, 600)
+    with pytest.raises(ValueError, match="300 or 600"):
+        store.set_duration_limit(123, invalid)
+    assert store.get_duration_limit(123) == 600
+
+
+@pytest.mark.parametrize("invalid", [True, False, None, "300", 300.0, -1, 0, 601])
+def test_enqueue_rejects_invalid_duration_without_creating_job(store: Store, invalid):
+    with pytest.raises(ValueError, match="integer between 1 and 600"):
+        enqueue(store, duration_limit=invalid)
+    assert store.pending_count() == 0
+
+
+@pytest.mark.parametrize("duration_limit", [1, 300, 600])
+def test_enqueue_accepts_bounded_integer_duration(store: Store, duration_limit: int):
+    job, created = enqueue(store, duration_limit=duration_limit)
+    assert created
+    assert job.duration_limit == duration_limit
+    assert store.next_job().duration_limit == duration_limit
+
+
+def test_duration_snapshot_survives_preference_changes_duplicates_and_restart(
+    tmp_path: Path, clock: Clock
+):
+    directory = tmp_path / "data"
+    original = Store(directory, clock=clock)
+    try:
+        original.set_duration_limit(123, 600)
+        job, _ = enqueue(original, duration_limit=original.get_duration_limit(123))
+        original.set_duration_limit(123, 300)
+        duplicate, created = enqueue(original, duration_limit=300)
+        assert not created
+        assert duplicate.duration_limit == 600
+        assert original.next_job().duration_limit == 600
+        duplicate, created = enqueue(original, duration_limit=300)
+        assert not created
+        assert duplicate.duration_limit == 600
+    finally:
+        original.close()
+
+    restarted = Store(directory, clock=clock)
+    try:
+        assert restarted.get_duration_limit(123) == 300
+        restarted.recover()
+        recovered = restarted.next_job()
+        assert recovered.id == job.id
+        assert recovered.duration_limit == 600
+        restarted.complete(job.id, "source text", "en", "{}")
+        duplicate, created = enqueue(restarted, duration_limit=300)
+        assert not created
+        assert duplicate.state == "done"
+        assert duplicate.duration_limit == 600
+        second, created = enqueue(
+            restarted, "second", duration_limit=restarted.get_duration_limit(123)
+        )
+        assert created
+        assert second.duration_limit == 300
+    finally:
+        restarted.close()
+
+
+def test_failed_retry_takes_new_duration_but_invalid_retry_preserves_job(store: Store):
+    job, _ = enqueue(store, duration_limit=300)
+    store.fail(job.id)
+    with pytest.raises(ValueError):
+        enqueue(store, duration_limit=601)
+    unchanged = store.get(job.id, 123, 123)
+    assert unchanged.duration_limit == 300
+    assert unchanged.state == "failed"
+    retried, created = enqueue(store, duration_limit=600)
+    assert not created
+    assert retried.id == job.id
+    assert retried.state == "queued"
+    assert retried.duration_limit == 600
+
+
+def test_old_schema_migration_preserves_jobs_language_and_later_duration_settings(
+    tmp_path: Path, clock: Clock
+):
+    directory = tmp_path / "data"
+    directory.mkdir()
+    database = directory / "queue.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
+                file_unique_id TEXT NOT NULL,
+                status_message_id INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('queued', 'processing', 'done', 'failed')),
+                transcript TEXT,
+                summary_json TEXT,
+                language TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE (user_id, file_unique_id)
+            );
+            CREATE INDEX jobs_pending ON jobs (state, created_at);
+            CREATE INDEX jobs_expiry ON jobs (state, updated_at);
+            CREATE TABLE preferences (
+                user_id INTEGER PRIMARY KEY,
+                language TEXT NOT NULL CHECK (language IN ('auto', 'en', 'ru'))
+            );
+            INSERT INTO preferences VALUES (123, 'ru');
+            INSERT INTO preferences VALUES (456, 'en');
+            """
+        )
+        connection.executemany(
+            "INSERT INTO jobs VALUES (?, 123, 123, 10, 'file', ?, 11, ?, ?, ?, ?, 900, 950)",
+            [
+                ("queued", "queued-audio", "queued", None, None, None),
+                ("processing", "processing-audio", "processing", "partial", None, "ru"),
+                ("done", "done-audio", "done", "complete", '{"summary":"saved"}', "ru"),
+            ],
+        )
+
+    migrated = Store(directory, clock=clock)
+    try:
+        assert migrated.get_language(123) == "ru"
+        assert migrated.get_language(456) == "en"
+        assert migrated.get_duration_limit(123) == 600
+        for job_id in ("queued", "processing", "done"):
+            job = migrated.get(job_id, 123, 123)
+            assert job.state == job_id
+            assert job.duration_limit == 300
+            assert job.created_at == 900
+        assert migrated.get("processing", 123, 123).transcript == "partial"
+        done = migrated.get("done", 123, 123)
+        assert done.transcript == "complete"
+        assert done.summary_json == '{"summary":"saved"}'
+        assert done.language == "ru"
+        migrated.set_duration_limit(123, 300)
+        new_job, _ = enqueue(migrated, "new", duration_limit=600)
+    finally:
+        migrated.close()
+
+    reopened = Store(directory, clock=clock)
+    try:
+        assert reopened.get_duration_limit(123) == 300
+        assert reopened.get_language(123) == "ru"
+        assert reopened.get(new_job.id, 123, 123).duration_limit == 600
+        assert reopened.get("queued", 123, 123).duration_limit == 300
+        with sqlite3.connect(database) as connection:
+            columns = [row[1] for row in connection.execute("PRAGMA table_info(jobs)")]
+            assert columns.count("duration_limit") == 1
+            for invalid in (None, 0, 601):
+                with pytest.raises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "UPDATE jobs SET duration_limit = ? WHERE id = 'queued'", (invalid,)
+                    )
+    finally:
+        reopened.close()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file permissions")
 def test_existing_directory_and_database_permissions_are_private(tmp_path: Path):
     directory = tmp_path / "data"

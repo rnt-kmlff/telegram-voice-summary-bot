@@ -1,13 +1,16 @@
+import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from telegram.error import BadRequest, NetworkError
 
 from voice_summary_bot.bot import ProcessLock, VoiceBot, authorized, cleanup_audio, render_summary
 from voice_summary_bot.config import Settings
-from voice_summary_bot.inference import InferenceError, Summary, Transcript
+from voice_summary_bot.inference import AudioDurationError, InferenceError, Summary, Transcript
 from voice_summary_bot.storage import Store
 
 
@@ -27,7 +30,7 @@ def update(user_id=1, chat_type="private", **media):
 
 @pytest.fixture
 def setup(tmp_path):
-    settings = Settings(allowed_user_ids=frozenset({1}), data_dir=tmp_path)
+    settings = Settings(allowed_user_ids=frozenset({1}), data_dir=tmp_path, max_duration=600)
     store = Store(tmp_path)
     transcriber = SimpleNamespace(transcribe=AsyncMock(return_value=Transcript("Hello", "en")))
     summarizer = SimpleNamespace(
@@ -47,7 +50,7 @@ def test_private_owner_only(setup):
     assert not authorized(update(chat_type="group"), settings)
 
 
-@pytest.mark.parametrize("duration,size", [(301, 100), (10, 20_000_001)])
+@pytest.mark.parametrize("duration,size", [(601, 100), (10, 20_000_001)])
 async def test_reject_oversize_before_queue(setup, duration, size):
     _, store, adapter = setup
     event = update(voice=SimpleNamespace(duration=duration, file_size=size))
@@ -244,3 +247,217 @@ def test_crash_cleanup_only_removes_our_temporary_directories(tmp_path):
     cleanup_audio(tmp_path)
     assert not ours.exists()
     assert preserved.exists()
+
+
+async def test_limit_shows_current_selection_and_two_buttons(setup):
+    _, _, adapter = setup
+    event = update()
+    await adapter.limit(event, SimpleNamespace(args=[]))
+    reply = event.effective_message.reply_text.call_args
+    assert "Audio limit: 10 minutes" in reply.args[0]
+    assert "future recordings" in reply.args[0]
+    assert "queued recordings keep their accepted limit" in reply.args[0]
+    buttons = reply.kwargs["reply_markup"].inline_keyboard[0]
+    assert [(button.text, button.callback_data) for button in buttons] == [
+        ("5 minutes", "limit:5"),
+        ("✓ 10 minutes", "limit:10"),
+    ]
+
+
+async def test_limit_command_persists_and_help_status_use_selection(setup):
+    settings, _, adapter = setup
+    event = update()
+    await adapter.limit(event, SimpleNamespace(args=["5"]))
+    reloaded = Store(settings.data_dir)
+    try:
+        assert reloaded.get_duration_limit(1) == 300
+    finally:
+        reloaded.close()
+    await adapter.help(event, None)
+    assert "up to 5 minutes" in event.effective_message.reply_text.call_args.args[0]
+    await adapter.status(event, None)
+    assert "Audio limit: 5 minutes" in event.effective_message.reply_text.call_args.args[0]
+
+
+@pytest.mark.parametrize("args", [["15"], ["0"], ["5", "10"], ["600"]])
+async def test_invalid_limit_command_does_not_change_preference(setup, args):
+    _, store, adapter = setup
+    store.set_duration_limit(1, 300)
+    event = update()
+    await adapter.limit(event, SimpleNamespace(args=args))
+    assert store.get_duration_limit(1) == 300
+    assert "Use /limit 5 or /limit 10" in event.effective_message.reply_text.call_args.args[0]
+
+
+@pytest.mark.parametrize("user_id,chat_type", [(2, "private"), (1, "group")])
+async def test_limit_command_and_callback_reject_unauthorized_context(setup, user_id, chat_type):
+    _, store, adapter = setup
+    event = update(user_id=user_id, chat_type=chat_type)
+    event.callback_query = SimpleNamespace(
+        data="limit:5", answer=AsyncMock(), edit_message_text=AsyncMock()
+    )
+    await adapter.limit(event, SimpleNamespace(args=["5"]))
+    await adapter.limit_callback(event, None)
+    event.effective_message.reply_text.assert_not_awaited()
+    event.callback_query.edit_message_text.assert_not_awaited()
+    event.callback_query.answer.assert_awaited_once_with("Unavailable.", show_alert=True)
+    assert store.get_duration_limit(user_id) == 600
+
+
+async def test_limit_callback_updates_selection_and_handles_repeated_click(setup):
+    _, store, adapter = setup
+    event = update()
+    event.callback_query = SimpleNamespace(
+        data="limit:5", answer=AsyncMock(), edit_message_text=AsyncMock()
+    )
+    await adapter.limit_callback(event, None)
+    assert store.get_duration_limit(1) == 300
+    assert "Audio limit: 5 minutes" in event.callback_query.edit_message_text.call_args.args[0]
+    event.callback_query.edit_message_text.side_effect = BadRequest("Message is not modified")
+    await adapter.limit_callback(event, None)
+    assert store.get_duration_limit(1) == 300
+
+
+async def test_forged_limit_callback_cannot_raise_limit(setup):
+    _, store, adapter = setup
+    event = update()
+    event.callback_query = SimpleNamespace(
+        data="limit:60", answer=AsyncMock(), edit_message_text=AsyncMock()
+    )
+    await adapter.limit_callback(event, None)
+    assert store.get_duration_limit(1) == 600
+    event.callback_query.edit_message_text.assert_not_awaited()
+    assert event.callback_query.answer.call_args.kwargs["show_alert"] is True
+
+
+async def test_limit_cannot_exceed_deployment_ceiling(tmp_path):
+    settings = Settings(allowed_user_ids=frozenset({1}), data_dir=tmp_path, max_duration=300)
+    store = Store(tmp_path)
+    try:
+        store.set_duration_limit(1, 600)
+        adapter = VoiceBot(settings, store, None, None)
+        event = update()
+        await adapter.limit(event, SimpleNamespace(args=["10"]))
+        assert "at most 5 minutes" in event.effective_message.reply_text.call_args.args[0]
+        assert "remains 5 minutes" in event.effective_message.reply_text.call_args.args[0]
+        assert adapter.duration_limit(1) == 300
+        event.callback_query = SimpleNamespace(
+            data="limit:10", answer=AsyncMock(), edit_message_text=AsyncMock()
+        )
+        await adapter.limit_callback(event, None)
+        assert "at most 5 minutes" in event.callback_query.answer.call_args.args[0]
+        event.callback_query.edit_message_text.assert_not_awaited()
+    finally:
+        store.close()
+
+
+async def test_six_minute_audio_rejected_at_five_then_accepted_at_ten(setup):
+    _, store, adapter = setup
+    store.set_duration_limit(1, 300)
+    media = SimpleNamespace(duration=360, file_size=400, file_id="file", file_unique_id="unique")
+    event = update(voice=media)
+    await adapter.receive(event, None)
+    assert store.pending_count() == 0
+    assert "audio limit is 5 minutes" in event.effective_message.reply_text.call_args.args[0]
+    await adapter.limit(update(), SimpleNamespace(args=["10"]))
+    await adapter.receive(event, None)
+    accepted = store.next_job()
+    assert accepted.duration_limit == 600
+
+
+@pytest.mark.parametrize(
+    "accepted,subsequent,deployment_cap", [(300, 600, 600), (600, 300, 600), (600, 600, 300)]
+)
+async def test_processing_uses_accepted_limit_even_after_preference_changes(
+    setup, accepted, subsequent, deployment_cap
+):
+    _, store, adapter = setup
+    store.set_duration_limit(1, accepted)
+    # Telegram duration is untrusted; the decoder receives the snapshot even when metadata is short.
+    media = SimpleNamespace(duration=1, file_size=400, file_id="file", file_unique_id="unique")
+    await adapter.receive(update(voice=media), None)
+    store.set_duration_limit(1, subsequent)
+    adapter.settings = replace(adapter.settings, max_duration=deployment_cap)
+    adapter.transcriber.max_duration = 600
+    job = store.next_job()
+
+    async def download(destination):
+        destination.write_bytes(b"synthetic fixture")
+
+    app = SimpleNamespace(
+        bot=SimpleNamespace(
+            get_file=AsyncMock(
+                return_value=SimpleNamespace(
+                    file_size=20, download_to_drive=AsyncMock(side_effect=download)
+                )
+            ),
+            edit_message_text=AsyncMock(),
+        )
+    )
+    await adapter.process_job(app, job)
+    assert adapter.transcriber.transcribe.call_args.kwargs["max_duration"] == min(
+        accepted, deployment_cap
+    )
+    assert adapter.transcriber.max_duration == 600
+
+
+async def test_actual_duration_rejection_shows_accepted_limit(setup):
+    _, store, adapter = setup
+    job = enqueue(store)
+    adapter.process_job = AsyncMock(side_effect=AudioDurationError("too long"))
+    delivered = asyncio.Event()
+
+    async def edited(**kwargs):
+        delivered.set()
+
+    app = SimpleNamespace(bot=SimpleNamespace(edit_message_text=AsyncMock(side_effect=edited)))
+    task = asyncio.create_task(adapter.worker(app))
+    try:
+        await asyncio.wait_for(delivered.wait(), timeout=2)
+        assert store.get(job.id, 1, 1).state == "failed"
+        assert (
+            "accepted audio limit of 5 minutes"
+            in app.bot.edit_message_text.call_args.kwargs["text"]
+        )
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_commands_menu_is_scoped_to_authorized_private_chat(setup):
+    _, _, adapter = setup
+    app = SimpleNamespace(
+        bot=SimpleNamespace(set_my_commands=AsyncMock(), set_chat_menu_button=AsyncMock())
+    )
+    await adapter.register_commands(app)
+    call = app.bot.set_my_commands.call_args
+    assert [command.command for command in call.args[0]] == [
+        "start",
+        "help",
+        "language",
+        "limit",
+        "status",
+    ]
+    assert call.kwargs["scope"].type == "chat"
+    assert call.kwargs["scope"].chat_id == 1
+    assert app.bot.set_chat_menu_button.call_args.kwargs["chat_id"] == 1
+
+
+async def test_menu_failure_does_not_stop_worker_or_log_exception_content(setup, caplog):
+    _, _, adapter = setup
+    app = SimpleNamespace(
+        bot=SimpleNamespace(
+            set_my_commands=AsyncMock(side_effect=NetworkError("private request detail")),
+            set_chat_menu_button=AsyncMock(),
+        )
+    )
+    await adapter.start(app)
+    try:
+        await asyncio.sleep(0)
+        assert not adapter.worker_task.done()
+        assert not adapter.worker_failed
+        assert "Command menu could not be updated" in caplog.text
+        assert "private request detail" not in caplog.text
+    finally:
+        await adapter.stop(app)

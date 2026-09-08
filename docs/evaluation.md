@@ -1,8 +1,8 @@
 # Evaluation
 
-Automated tests cover authorization, private-chat restrictions, input limits, subprocess cleanup, local-only model requests, malformed/truncated model output, transcript ownership, duplicate handling, bounded queues, restart recovery and expiry. Summary tests cover full-transcript input, language routing, excessive-length retry and compatibility with older cached excerpts. They use synthetic data and mocked network responses, not real Telegram accounts, and do not establish model accuracy.
+Automated tests cover authorization, private-chat restrictions, input limits, subprocess cleanup, local-only model requests, malformed/truncated model output, transcript ownership, duplicate handling, bounded queues, restart recovery and expiry. Duration tests cover persistent per-user choices, migration of existing jobs, fixed limits for queued recordings, deployment ceilings, command buttons, and decoded WAV boundaries at exactly 300/600 seconds and one frame over. Summary tests cover full-transcript input, language routing, excessive-length retry and compatibility with older cached excerpts. They use synthetic data and mocked network responses, not real Telegram accounts, and do not establish model accuracy.
 
-A synthetic English/Russian smoke test checks that the installed Whisper and Qwen models run together. Synthetic speech is easier than noisy forwarded recordings and does not establish real-world accuracy or five-minute latency.
+A synthetic English/Russian smoke test checks that the installed Whisper and Qwen models run together. Synthetic speech is easier than noisy forwarded recordings and does not establish real-world accuracy.
 
 ## Initial local checks
 
@@ -14,7 +14,22 @@ The personal pilot then exposed a usability problem: conversational transcripts 
 
 Live checks produced substantially shorter paragraphs for longer recordings. Remaining errors included an already-completed action being described as a new task, an inferred causal link, and a speaker's commitment retaining first-person wording. The three initial pilot replies were manually reviewed and corrected before replacement; that human review is not an automatic service feature. Automated tests verify the application behavior, not the truth of a model-generated summary. A second model editing pass did not reliably fix the errors and was not added. The slower thinking-mode experiment timed out and was not enabled.
 
-Speech recognition, summarization and translation can still introduce errors or omit context. Five-minute turnaround time and long-term sleep/restart reliability are not established by the short checks above.
+Speech recognition, summarization and translation can still introduce errors or omit context. Long-recording turnaround time and long-term sleep/restart reliability are not established by the short checks above.
+
+## Ten-minute local checks — 8 September 2026
+
+Two synthetic workshop updates, one English and one Russian, were generated with macOS speech synthesis and normalized to exactly 600 seconds. Each contained 20 similar sections with distinct checkpoints at the beginning, middle and end, plus a pending second-room offer and final instructions about dates and booking confirmation. The Opus files were about 3.3–3.4 MB each.
+
+On the same Apple M4 / 16 GiB Mac, using Whisper `large-v3-turbo` and Qwen3.5 9B with a 16,384-token context and thinking disabled:
+
+| Recording | Transcription | Summary | Local pipeline total |
+|---|---:|---:|---:|
+| English, 10 minutes | 60.48 s | 37.78 s | 98.26 s |
+| Russian, 10 minutes | 68.92 s | 37.94 s | 106.86 s |
+
+Both transcripts contained all three checkpoints, including the final one. Both summaries condensed the repeated sections into a paragraph and retained the pending room offer, Friday plan, Thursday-evening question deadline and instruction to wait for booking confirmation before publishing invitations. The same ten-minute English file was rejected in five-minute mode after decoding, before Whisper ran (0.42 seconds).
+
+These are individual local runs, excluding Telegram transfer and queue waiting. Repetitive synthetic speech is easier to summarize than a recording with many unrelated topics; the checks establish operation at ten minutes, not a general accuracy or latency guarantee. The deployed service's command menu and persisted ten-minute preference were read back separately through Telegram and local storage.
 
 ## Personal pilot
 
@@ -27,7 +42,7 @@ Before relying on summaries, evaluate 10–15 representative recordings across:
 | Amounts and dates | Exact values and units; no inferred calendar dates |
 | Negation and tentative plans | Pending approval stays pending; do-not instructions remain negative |
 | Background noise and silence | No fabricated transcript or summary |
-| Short and five-minute notes | Full content processed within acceptable time |
+| Short, five-minute and ten-minute notes | Full content processed within acceptable time |
 | Summary model unavailable | Transcript remains available and retry works |
 | Sleep/restart | Pending work resumes when the bot restarts |
 
