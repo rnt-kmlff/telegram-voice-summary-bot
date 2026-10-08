@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -413,6 +414,8 @@ def test_old_schema_migration_preserves_jobs_language_and_later_duration_setting
             assert job.state == job_id
             assert job.duration_limit == 300
             assert job.created_at == 900
+            assert job.raw_transcript is None
+            assert job.removed_endings_json is None
         assert migrated.get("processing", 123, 123).transcript == "partial"
         done = migrated.get("done", 123, 123)
         assert done.transcript == "complete"
@@ -432,6 +435,8 @@ def test_old_schema_migration_preserves_jobs_language_and_later_duration_setting
         with sqlite3.connect(database) as connection:
             columns = [row[1] for row in connection.execute("PRAGMA table_info(jobs)")]
             assert columns.count("duration_limit") == 1
+            assert columns.count("raw_transcript") == 1
+            assert columns.count("removed_endings_json") == 1
             for invalid in (None, 0, 601):
                 with pytest.raises(sqlite3.IntegrityError):
                     connection.execute(
@@ -477,3 +482,68 @@ def test_two_connections_cannot_claim_the_same_job(tmp_path: Path):
         assert [result.id for result in results if result is not None] == [original.id]
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("terminal_state", ["done", "failed"])
+def test_cleanup_audit_survives_restart_and_expires_with_job(tmp_path, clock, terminal_state):
+    directory = tmp_path / "data"
+    store = Store(directory, ttl_hours=1, clock=clock)
+    raw = "raw-private-audit-marker"
+    removed = ("removed-private-audit-marker",)
+    try:
+        job, _ = enqueue(store)
+        store.next_job()
+        store.save_transcript(
+            job.id, "Clean text.", "en", raw_transcript=raw, removed_endings=removed
+        )
+        if terminal_state == "done":
+            store.complete(job.id, "Clean text.", "en", "{}")
+        else:
+            store.fail(job.id)
+    finally:
+        store.close()
+    reopened = Store(directory, ttl_hours=1, clock=clock)
+    try:
+        saved = reopened.get(job.id, 123, 123)
+        assert saved.state == terminal_state
+        assert saved.transcript == "Clean text."
+        assert saved.raw_transcript == raw
+        assert json.loads(saved.removed_endings_json) == list(removed)
+        assert raw not in repr(saved) and removed[0] not in repr(saved)
+        assert reopened.get(job.id, 999, 123) is None
+        clock.now += 3600
+        reopened.purge()
+        assert reopened.get(job.id, 123, 123) is None
+        for path in directory.glob("queue.sqlite3*"):
+            assert raw.encode() not in path.read_bytes()
+            assert removed[0].encode() not in path.read_bytes()
+    finally:
+        reopened.close()
+
+
+def test_retry_clears_previous_cleanup_audit(store):
+    job, _ = enqueue(store)
+    store.next_job()
+    store.save_transcript(
+        job.id, "Clean.", "en", raw_transcript="Raw.", removed_endings=("Credit.",)
+    )
+    store.complete(job.id, "Clean.", "en", "{}")
+    duplicate, created = enqueue(store)
+    assert not created and duplicate.raw_transcript == "Raw."
+    assert json.loads(duplicate.removed_endings_json) == ["Credit."]
+    store.fail(job.id)
+    retried, _ = enqueue(store)
+    assert retried.transcript is None
+    assert retried.raw_transcript is None
+    assert retried.removed_endings_json is None
+
+
+def test_credit_only_result_can_be_audited_without_cleaned_text(store):
+    job, _ = enqueue(store)
+    store.next_job()
+    store.save_transcript(job.id, "", "ru", raw_transcript="Credit.", removed_endings=("Credit.",))
+    store.fail(job.id)
+    result = store.get(job.id, 123, 123)
+    assert result.transcript == ""
+    assert result.raw_transcript == "Credit."
+    assert result.state == "failed"

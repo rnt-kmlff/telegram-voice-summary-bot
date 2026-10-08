@@ -17,6 +17,7 @@ flowchart LR
 - Private chats restricted to an explicit user allowlist.
 - Local Apple Silicon speech recognition, with Qwen3.5 9B for summaries.
 - Summaries condense the whole transcript with controlled rephrasing, removing filler and repetition. Explicitly requested translations are labeled as machine translations.
+- A conservative list removes distinctive Whisper subtitle-credit endings before summarization, with the unfiltered text and removal record retained locally for review.
 - A durable SQLite queue, one inference job at a time, and duplicate detection.
 - Summary language selection, transcript download and temporary-audio cleanup.
 - A standalone text-summary command that other local tools can reuse.
@@ -75,7 +76,7 @@ The default summary model is [`qwen3.5:9b`](https://ollama.com/library/qwen3.5:9
 
 ## Using the bot
 
-Forward or send a voice message or audio file in a private chat. The bot acknowledges receipt, then updates that message with a short paragraph covering the main point and important requests or qualifications. **Full transcript** returns a text file with the complete summary and original transcript. Previously cached excerpt-style replies remain labeled as excerpts until replaced or expired.
+Forward or send a voice message or audio file in a private chat. The bot acknowledges receipt, then updates that message with a short paragraph covering the main point and important requests or qualifications. **Full transcript** returns a text file with the complete summary and transcript, including a cleanup note if a known subtitle-credit ending was removed. Previously cached excerpt-style replies remain labeled as excerpts until replaced or expired.
 
 - `/start` or `/help`: brief instructions.
 - `/language auto`, `/language en`, `/language ru`: choose the summary language. `auto` follows the source language. A summary requested in a different language is labeled as machine-translated and should be checked against the original transcript.
@@ -88,6 +89,14 @@ Changing the limit affects future recordings. Already queued recordings retain t
 
 If processing fails, forward the message again to retry. If only summarization fails, the available transcript remains accessible. This initial version does not ingest chat histories, join groups, send messages to other people, or execute instructions spoken in a recording.
 
+### Known Whisper endings
+
+The editable literal list is [whisper_endings.txt](src/voice_summary_bot/whisper_endings.txt). It initially contains the confirmed Russian credits `Субтитры сделал DimaTorzok` and `Субтитры создавал DimaTorzok`. Matching ignores case, whitespace and common punctuation. Only complete trailing Whisper segments match, including a credit split across consecutive final segments; an ordinary segment stops the scan. Quoted credits, mentions in the middle, and credits embedded in a longer segment are preserved. Ordinary closings such as “Спасибо” and “Thank you for watching” are not on the list. Timestamps alone never cause removal.
+
+Cleaned text is used for Qwen and the transcript download. If cleanup changed it, the unfiltered transcript text and exact removed endings are stored in the same private job row (`raw_transcript` and `removed_endings_json`), survive a restart or summary failure, and expire with that job. They are not sent to Qwen or added to Telegram exports. A retry clears the prior audit before processing again. If cleanup leaves no text, the bot reports that no usable speech remains and skips summarization, while retaining the local audit until expiry.
+
+To extend the list, add a distinctive, verified credit on its own line, add synthetic regression cases, run the tests, and restart the bot. Broad phrases risk deleting actual speech. This is a narrow heuristic, not a general hallucination detector or voice-activity detector; even a listed credit could be intentionally spoken. Existing cached results and previously sent Telegram files are not rewritten.
+
 ## Local use without Telegram
 
 These commands do not require a bot token:
@@ -98,11 +107,11 @@ uv run voice-summary process recording.ogg --language en
 uv run voice-summary summarize transcript.txt --language auto
 ```
 
-`process` and `summarize` return JSON. The summarize command is a small local helper suitable for reviewed use from Codex. It does not grant Qwen file access, tools, or authority to change anything. See [reusing the local model](docs/local-model-reuse.md).
+`process` and `summarize` return JSON. When audio cleanup occurs, `process` also includes a `transcription_cleanup` object containing the unfiltered text and removed endings; `transcribe` prints only the cleaned text. The text-only `summarize` command leaves supplied text unchanged. CLI output is not kept in the bot's database and any saved output has its own retention. The summarize command is a small local helper suitable for reviewed use from Codex. It does not grant Qwen file access, tools, or authority to change anything. See [reusing the local model](docs/local-model-reuse.md).
 
 ## Data and operation
 
-`.env`, recordings, model weights, the local database and logs are excluded from Git. Temporary downloaded and converted audio is removed after processing. SQLite holds queue metadata and recent transcripts/summaries in a directory restricted to the current account. Completed/failed records expire after 24 hours by default; cleanup runs while the bot is active and on startup. This is logical deletion, not a guarantee of forensic erasure or deletion from backups/Telegram.
+`.env`, recordings, model weights, the local database and logs are excluded from Git. Temporary downloaded and converted audio is removed after processing. SQLite holds queue metadata, recent transcripts/summaries and any transcription-cleanup audit in a directory restricted to the current account. Completed/failed records expire after 24 hours by default; cleanup runs while the bot is active and on startup. This is logical deletion, not a guarantee of forensic erasure or deletion from backups. Telegram messages and previously downloaded transcript files have separate retention; local expiry does not delete them.
 
 Only run one bot process per token. A local process lock prevents duplicate pollers in the same data directory. Jobs interrupted during inference are requeued on restart. Telegram replies and SQLite cannot share a transaction: a crash at the wrong time can leave an outdated status message, and manual forwarding may be required. Pending jobs are bounded; `/status` shows the queue size.
 

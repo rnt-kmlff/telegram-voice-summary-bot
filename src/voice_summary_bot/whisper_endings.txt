@@ -1,0 +1,8 @@
+# Confirmed, distinctive Whisper subtitle-credit artifacts, one literal phrase per line.
+# Only whole trailing Whisper segments (including a credit split across segments) match.
+# Matching ignores letter case, whitespace and . , : ; ! ? … punctuation.
+# Quoted credits and credits embedded in other speech are deliberately preserved.
+# Do not add ordinary speech such as "Thank you", "Спасибо" or "Продолжение следует".
+# After editing this list, run the tests and restart the bot.
+Субтитры сделал DimaTorzok
+Субтитры создавал DimaTorzok

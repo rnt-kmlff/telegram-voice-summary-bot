@@ -70,6 +70,8 @@ async def local_command(args, settings: Settings) -> None:
             max_duration=settings.max_duration,
         )
         transcript = await transcriber.transcribe(args.file, language=settings.whisper_language)
+    if not transcript.text.strip():
+        raise InferenceError("No usable speech remained after transcription cleanup.")
     if args.command == "transcribe":
         print(transcript.text)
         return
@@ -81,6 +83,11 @@ async def local_command(args, settings: Settings) -> None:
     result = {"summary": summary.model_dump()}
     if args.command == "process":
         result.update(transcript=transcript.text, source_language=transcript.language)
+        if transcript.removed_endings:
+            result["transcription_cleanup"] = {
+                "raw_transcript": transcript.raw_text,
+                "removed_endings": transcript.removed_endings,
+            }
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

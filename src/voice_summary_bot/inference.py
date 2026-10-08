@@ -11,7 +11,7 @@ import sys
 import wave
 from array import array
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Annotated, Any, Literal
@@ -19,6 +19,8 @@ from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
+
+from .transcript_cleanup import filter_whisper_endings
 
 MAX_TRANSCRIPT_CHARACTERS = 32_000
 _CONTEXT_TOKENS = 16384
@@ -37,6 +39,8 @@ class AudioDurationError(InferenceError):
 class Transcript:
     text: str
     language: str = "auto"
+    raw_text: str | None = field(default=None, repr=False)
+    removed_endings: tuple[str, ...] = field(default=(), repr=False)
 
 
 SummaryText = Annotated[
@@ -147,7 +151,13 @@ def _parse_whisper_json(path: Path, requested_language: str) -> Transcript:
         raise InferenceError("No speech could be transcribed from this recording.")
     if len(text) > 64_000:
         raise InferenceError("Whisper returned an unexpectedly long transcript.")
-    return Transcript(text=text, language=language)
+    cleaned, removed = filter_whisper_endings([segment["text"] for segment in segments])
+    return Transcript(
+        text=cleaned,
+        language=language,
+        raw_text=text if removed else None,
+        removed_endings=removed,
+    )
 
 
 class WhisperTranscriber:

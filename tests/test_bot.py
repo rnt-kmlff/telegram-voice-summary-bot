@@ -461,3 +461,78 @@ async def test_menu_failure_does_not_stop_worker_or_log_exception_content(setup,
         assert "private request detail" not in caplog.text
     finally:
         await adapter.stop(app)
+
+
+@pytest.mark.parametrize("summary_fails", [False, True])
+async def test_only_cleaned_text_reaches_summary_and_export_with_local_audit(setup, summary_fails):
+    _, store, adapter = setup
+    cleaned = "Please confirm on Friday."
+    credit = "Субтитры сделал DimaTorzok"
+    raw = f"{cleaned} {credit}"
+    adapter.transcriber.transcribe.return_value = Transcript(cleaned, "en", raw, (credit,))
+    if summary_fails:
+        adapter.summarizer.summarize.side_effect = InferenceError("offline")
+    job = enqueue(store)
+    store.next_job()
+
+    async def download(destination):
+        destination.write_bytes(b"synthetic audio")
+
+    app = SimpleNamespace(
+        bot=SimpleNamespace(
+            get_file=AsyncMock(
+                return_value=SimpleNamespace(
+                    file_size=15, download_to_drive=AsyncMock(side_effect=download)
+                )
+            ),
+            edit_message_text=AsyncMock(),
+        )
+    )
+    await adapter.process_job(app, job)
+    received = adapter.summarizer.summarize.call_args.args[0]
+    assert received == Transcript(cleaned, "en")
+    saved = store.get(job.id, 1, 1)
+    assert saved.state == ("failed" if summary_fails else "done")
+    assert saved.transcript == cleaned
+    assert saved.raw_transcript == raw
+    assert json.loads(saved.removed_endings_json) == [credit]
+
+    event = update()
+    event.callback_query = SimpleNamespace(data=f"transcript:{job.id}", answer=AsyncMock())
+    context = SimpleNamespace(bot=SimpleNamespace(send_document=AsyncMock()))
+    await adapter.transcript(event, context)
+    exported = context.bot.send_document.call_args.kwargs["document"].getvalue().decode()
+    assert cleaned in exported
+    assert "Transcription cleanup" in exported
+    assert credit not in exported and raw not in exported
+
+
+async def test_credit_only_result_is_not_summarized_but_audit_is_retained(setup):
+    _, store, adapter = setup
+    credit = "Субтитры сделал DimaTorzok"
+    adapter.transcriber.transcribe.return_value = Transcript("", "ru", credit, (credit,))
+    job = enqueue(store)
+    store.next_job()
+
+    async def download(destination):
+        destination.write_bytes(b"synthetic audio")
+
+    app = SimpleNamespace(
+        bot=SimpleNamespace(
+            get_file=AsyncMock(
+                return_value=SimpleNamespace(
+                    file_size=15, download_to_drive=AsyncMock(side_effect=download)
+                )
+            ),
+            edit_message_text=AsyncMock(),
+        )
+    )
+    await adapter.process_job(app, job)
+    adapter.summarizer.summarize.assert_not_awaited()
+    saved = store.get(job.id, 1, 1)
+    assert saved.state == "failed" and saved.transcript == ""
+    assert saved.raw_transcript == credit
+    assert json.loads(saved.removed_endings_json) == [credit]
+    reply = app.bot.edit_message_text.call_args.kwargs
+    assert "No usable speech" in reply["text"]
+    assert reply["reply_markup"] is None

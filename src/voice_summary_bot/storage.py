@@ -1,5 +1,6 @@
 """Private SQLite job queue. Store instances are used on their creating thread."""
 
+import json
 import os
 import sqlite3
 import time
@@ -29,6 +30,8 @@ class Job:
     language: str | None
     created_at: float
     duration_limit: int = 300
+    raw_transcript: str | None = field(default=None, repr=False)
+    removed_endings_json: str | None = field(default=None, repr=False)
 
 
 class Store:
@@ -81,6 +84,8 @@ class Store:
                     status_message_id INTEGER NOT NULL,
                     state TEXT NOT NULL CHECK (state IN ('queued', 'processing', 'done', 'failed')),
                     transcript TEXT,
+                    raw_transcript TEXT,
+                    removed_endings_json TEXT,
                     summary_json TEXT,
                     language TEXT,
                     created_at REAL NOT NULL,
@@ -113,6 +118,9 @@ class Store:
                         "ALTER TABLE jobs ADD COLUMN duration_limit INTEGER NOT NULL "
                         "DEFAULT 300 CHECK (duration_limit BETWEEN 1 AND 600)"
                     )
+                for column in ("raw_transcript", "removed_endings_json"):
+                    if column not in columns:
+                        self._connection.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
             self._private_files()
             self.purge()
         except BaseException:
@@ -240,6 +248,7 @@ class Store:
                 self._connection.execute(
                     "UPDATE jobs SET chat_id = ?, message_id = ?, file_id = ?, "
                     "status_message_id = ?, state = 'queued', transcript = NULL, "
+                    "raw_transcript = NULL, removed_endings_json = NULL, "
                     "summary_json = NULL, language = NULL, created_at = ?, updated_at = ?, "
                     "duration_limit = ? "
                     "WHERE id = ?",
@@ -296,13 +305,31 @@ class Store:
                 self._connection.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
             )
 
-    def save_transcript(self, job_id: str, transcript: str, language: str) -> None:
-        """Persist transcription while the job remains recoverable as processing."""
+    def save_transcript(
+        self,
+        job_id: str,
+        transcript: str,
+        language: str,
+        *,
+        raw_transcript: str | None = None,
+        removed_endings: tuple[str, ...] = (),
+    ) -> None:
+        """Save cleaned text and its local audit together, under the same job TTL."""
+        if removed_endings and not raw_transcript:
+            raise ValueError("Removed endings require an original transcript for the audit.")
         self._maybe_purge()
         self._connection.execute(
-            "UPDATE jobs SET transcript = ?, language = ?, updated_at = ? "
+            "UPDATE jobs SET transcript = ?, language = ?, raw_transcript = ?, "
+            "removed_endings_json = ?, updated_at = ? "
             "WHERE id = ? AND state = 'processing'",
-            (transcript, language, self._clock(), job_id),
+            (
+                transcript,
+                language,
+                raw_transcript,
+                json.dumps(removed_endings, ensure_ascii=False) if removed_endings else None,
+                self._clock(),
+                job_id,
+            ),
         )
 
     def complete(self, job_id: str, transcript: str, language: str, summary_json: str) -> None:

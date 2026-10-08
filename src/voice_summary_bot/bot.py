@@ -29,6 +29,7 @@ from .inference import (
     InferenceError,
     OllamaSummarizer,
     Summary,
+    Transcript,
     WhisperTranscriber,
 )
 from .storage import Job, QueueFull, Store
@@ -40,7 +41,8 @@ HELP = (
     "/language auto|en|ru — summary language\n"
     "/limit — choose a 5- or 10-minute audio limit\n"
     "/status — pending messages\n\n"
-    "Audio is processed locally. Recent transcripts expire after 24 hours by default. "
+    "Audio is processed locally. Local transcripts expire after 24 hours by default; "
+    "Telegram messages remain until deleted separately. "
     "Messages and replies still pass through Telegram. Check important details against the audio."
 )
 
@@ -387,6 +389,13 @@ class VoiceBot:
                 + "\n\n--- Full transcript ---\n\n"
                 + text
             )
+        if job.removed_endings_json:
+            text += (
+                "\n\n--- Transcription cleanup ---\n"
+                "Known subtitle-credit ending(s) were removed automatically. "
+                "The original text and removal record are retained locally under the same "
+                "expiry policy. Check the audio if that ending was intentional."
+            )
         document = io.BytesIO(text.encode("utf-8"))
         await context.bot.send_document(
             chat_id=job.chat_id,
@@ -429,14 +438,30 @@ class VoiceBot:
                 language=self.settings.whisper_language,
                 max_duration=min(job.duration_limit, self.settings.max_duration),
             )
-        if not transcript.text.strip():
-            raise InferenceError("No speech was detected.")
         # Save the transcript before summarizing, so model failure does not lose it.
-        self.store.save_transcript(job.id, transcript.text, transcript.language)
+        self.store.save_transcript(
+            job.id,
+            transcript.text,
+            transcript.language,
+            raw_transcript=transcript.raw_text,
+            removed_endings=transcript.removed_endings,
+        )
+        if not transcript.text.strip():
+            self.store.fail(job.id)
+            await self.edit_status(
+                application,
+                job,
+                "No usable speech remained after transcription cleanup. "
+                "Please send a clearer recording.",
+            )
+            return
         await self.edit_status(application, job, "Preparing your summary…", transcript=True)
         language = self.store.get_language(job.user_id, self.settings.summary_language)
         try:
-            summary = await self.summarizer.summarize(transcript, output_language=language)
+            # The local audit must never become model input or part of the summary.
+            summary = await self.summarizer.summarize(
+                Transcript(transcript.text, transcript.language), output_language=language
+            )
         except InferenceError:
             self.store.fail(job.id)
             await self.edit_status(

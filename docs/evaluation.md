@@ -31,6 +31,12 @@ Both transcripts contained all three checkpoints, including the final one. Both 
 
 These are individual local runs, excluding Telegram transfer and queue waiting. Repetitive synthetic speech is easier to summarize than a recording with many unrelated topics; the checks establish operation at ten minutes, not a general accuracy or latency guarantee. The deployed service's command menu and persisted ten-minute preference were read back separately through Telegram and local storage.
 
+## Whisper ending cleanup — 8 October 2026
+
+A privately supplied Russian recording reproduced the distinctive `Субтитры сделал DimaTorzok` ending in a separate final Whisper segment. With the literal ending filter enabled, the unfiltered output matched the previously exported transcript exactly; the cleaned text matched it exactly after removing only that credit. The local audit was saved and read back successfully. Temporary diagnostic copies were removed, and no private recording or transcript was added to this repository.
+
+Synthetic regression tests cover case/punctuation variants, credits split across final segments, repeated credits, ordinary closings, quoted/embedded/mid-transcript mentions, invalid timestamps accompanying genuine words, and recordings containing only a credit. Integration tests verify that only cleaned text reaches summarization and Telegram exports, while the local audit survives restart/summary failure and is erased with the terminal job at expiry. Package validation also checks that the editable list is included in the wheel. These checks validate this narrow filter; they do not establish detection of other hallucinations.
+
 ## Personal pilot
 
 Before relying on summaries, evaluate 10–15 representative recordings across:

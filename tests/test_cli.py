@@ -85,3 +85,73 @@ def test_filter_strips_cached_exception_text_without_mutating_shared_record(outp
     assert record.exc_info is exception_info
     assert record.exc_text == "cached traceback containing synthetic-private-credential"
     assert record.stack_info == "private stack details"
+
+
+@pytest.mark.parametrize("command", ["process", "transcribe"])
+async def test_audio_cli_returns_cleaned_text_and_process_audit(monkeypatch, capsys, command):
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from voice_summary_bot import cli
+    from voice_summary_bot.config import Settings
+    from voice_summary_bot.inference import Summary, Transcript
+
+    credit = "Субтитры сделал DimaTorzok"
+    raw = "Please confirm. " + credit
+    transcript = Transcript("Please confirm.", "en", raw, (credit,))
+    monkeypatch.setattr(
+        cli,
+        "WhisperTranscriber",
+        lambda *a, **kw: SimpleNamespace(transcribe=AsyncMock(return_value=transcript)),
+    )
+    summarizer = SimpleNamespace(
+        summarize=AsyncMock(
+            return_value=Summary(
+                overview="Please confirm.", key_points=[], actions=[], uncertainties=[]
+            )
+        ),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr(cli, "OllamaSummarizer", lambda *a: summarizer)
+    await cli.local_command(
+        SimpleNamespace(command=command, file=Path("unused"), language="auto"), Settings()
+    )
+    emitted = capsys.readouterr().out
+    if command == "transcribe":
+        assert emitted == "Please confirm.\n"
+        summarizer.summarize.assert_not_awaited()
+    else:
+        payload = json.loads(emitted)
+        assert payload["transcript"] == "Please confirm."
+        assert payload["transcription_cleanup"] == {
+            "raw_transcript": raw,
+            "removed_endings": [credit],
+        }
+        summarizer.close.assert_awaited_once()
+
+
+async def test_text_only_summary_does_not_filter_user_supplied_text(monkeypatch, tmp_path, capsys):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from voice_summary_bot import cli
+    from voice_summary_bot.config import Settings
+    from voice_summary_bot.inference import Summary
+
+    path = tmp_path / "source.txt"
+    source = "Субтитры сделал DimaTorzok"
+    path.write_text(source)
+    summarizer = SimpleNamespace(
+        summarize=AsyncMock(
+            return_value=Summary(overview=source, key_points=[], actions=[], uncertainties=[])
+        ),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr(cli, "OllamaSummarizer", lambda *a: summarizer)
+    await cli.local_command(
+        SimpleNamespace(command="summarize", file=path, language="auto"), Settings()
+    )
+    assert summarizer.summarize.call_args.args[0].text == source
+    assert "transcription_cleanup" not in capsys.readouterr().out
