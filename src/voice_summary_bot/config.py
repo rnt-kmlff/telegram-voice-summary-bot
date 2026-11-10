@@ -35,6 +35,8 @@ class Settings:
     model_path: Path = Path("models/ggml-large-v3-turbo.bin")
     whisper_binary: str = "whisper-cli"
     ffmpeg_binary: str = "ffmpeg"
+    vad_model_path: Path = Path("models/ggml-silero-v6.2.0.bin")
+    vad_binary: str = "whisper-vad-speech-segments"
     whisper_language: str = "auto"
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3.5:9b"
@@ -63,6 +65,10 @@ class Settings:
             .resolve(),
             whisper_binary=os.getenv("WHISPER_BINARY", "whisper-cli"),
             ffmpeg_binary=os.getenv("FFMPEG_BINARY", "ffmpeg"),
+            vad_model_path=Path(os.getenv("VAD_MODEL_PATH", "models/ggml-silero-v6.2.0.bin"))
+            .expanduser()
+            .resolve(),
+            vad_binary=os.getenv("VAD_BINARY", "whisper-vad-speech-segments"),
             whisper_language=language("WHISPER_LANGUAGE"),
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
             ollama_model=os.getenv("OLLAMA_MODEL", "qwen3.5:9b"),

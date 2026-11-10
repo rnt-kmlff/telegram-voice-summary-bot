@@ -190,7 +190,10 @@ def test_launchctl_never_inherits_private_environment(monkeypatch):
     assert seen["env"] == {"PATH": service.SERVICE_PATH}
 
 
-def test_validation_uses_checkout_env_and_restores_shell_environment(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("model_ready", [False, True])
+def test_validation_uses_checkout_env_and_restores_shell_environment(
+    tmp_path: Path, monkeypatch, model_ready
+):
     repo = tmp_path / "our repo"
     python = repo / ".venv/bin/python"
     python.parent.mkdir(parents=True)
@@ -208,12 +211,29 @@ def test_validation_uses_checkout_env_and_restores_shell_environment(tmp_path: P
         assert "TELEGRAM_BOT_TOKEN" not in service.os.environ
         service.os.environ["TELEGRAM_BOT_TOKEN"] = "file-marker"
         return SimpleNamespace(
-            model_path=model, whisper_binary="whisper-cli", ffmpeg_binary="ffmpeg"
+            model_path=model,
+            whisper_binary="whisper-cli",
+            ffmpeg_binary="ffmpeg",
+            vad_model_path=model,
+            vad_binary="whisper-vad-speech-segments",
         )
 
     monkeypatch.setattr(service.Settings, "load", load)
+
+    def verify(path):
+        from voice_summary_bot.errors import SpeechCheckUnavailableError
+
+        assert path == model
+        if not model_ready:
+            raise SpeechCheckUnavailableError()
+
+    monkeypatch.setattr("voice_summary_bot.speech_presence.verify_vad_model", verify)
     monkeypatch.setattr(service.shutil, "which", lambda command, *, path: f"/bin/{command}")
-    service.validate_install(repo)
+    if model_ready:
+        service.validate_install(repo)
+    else:
+        with pytest.raises(service.ServiceError, match="speech detector model"):
+            service.validate_install(repo)
     assert Path.cwd() == original_directory
     assert service.os.environ["TELEGRAM_BOT_TOKEN"] == "shell-marker"
 

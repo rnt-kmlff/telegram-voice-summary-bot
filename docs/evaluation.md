@@ -55,3 +55,25 @@ Before relying on summaries, evaluate 10–15 representative recordings across:
 Record duration, transcription time, summary time and material errors separately. Start with `large-v3-turbo`; compare `small` if memory or latency is a problem. Use the smallest model that preserves the details you need. Do not extrapolate from two short synthetic clips to a production accuracy claim.
 
 No private pilot audio, transcripts, credentials or model weights belong in this public repository. Live Telegram delivery requires a dedicated BotFather token and an explicit allowed-user list.
+
+## Speech-presence gate — 10 November 2026
+
+An isolated local pilot used whisper.cpp 1.9.2's CPU detector with the pinned Silero v6.2.0 model. Each clip ran sequentially; no Telegram delivery or Qwen request was involved. These are synthetic smoke checks, not estimates of real-world accuracy.
+
+| Synthetic sample | Duration | Detected speech | Result |
+| --- | ---: | ---: | --- |
+| English request, macOS Samantha | 4.108 s | 4.108 s | Accepted |
+| Russian request, macOS Milena | 6.264 s | 6.064 s | Accepted |
+| English “Yes” | 0.481 s | 0.481 s | Accepted |
+| Russian “Да” | 0.378 s | 0.348 s | Accepted |
+| English request at 8% amplitude | 4.108 s | 4.108 s | Accepted |
+| English request with 5 s leading and 10 s trailing silence | 19.108 s | 4.160 s | Accepted |
+| Digital silence | 15 s | 0 s | Rejected |
+| Alternating impulses every half second | 15 s | 0 s | Rejected |
+| Ten one-minute blocks, each starting with the English request | 600 s | 41.300 s | Accepted |
+
+Synthetic requests: “Please move our meeting to Friday at ten. I will send the revised document tomorrow.” and “Давай перенесём встречу на пятницу, на десять часов. Завтра я отправлю исправленный документ.” Speech was converted to mono 16 kHz signed 16-bit PCM. These generated files and model weights are not committed. The ten-minute CPU check took 0.923 seconds; the native child peaked at about 110 MiB RSS, measured by the operating system after exit. Memory pressure was green before and after the serial pilot. These are single-run observations, not performance guarantees.
+
+Automated regressions cover native centisecond units, threshold boundaries, overlapping spans, malformed/truncated/oversized output, missing/corrupt model, bounded downloads, timeout/cancellation cleanup, and no Whisper/Qwen call or transcript button after rejection. They also cover checked versus unchecked duplicate results, migration, capacity, restart and expiry. A byte-for-byte assertion verifies that successful detection does not trim the WAV sent to Whisper.
+
+Limitations: this gate detects speech-like activity, not intelligibility or transcription accuracy. Brief real speech in a long recording may be rejected; sufficiently speech-like noise may pass. Live Telegram delivery and operation after deployment require a separate activation check. The summary model and its prompt are unchanged, so a new real-Qwen inference pilot was not run for this change.

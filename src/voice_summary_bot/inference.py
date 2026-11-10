@@ -20,19 +20,13 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
+from .errors import AudioDurationError, InferenceError, NoClearSpeechError
+from .speech_presence import SpeechPresenceDetector
 from .transcript_cleanup import filter_whisper_endings
 
 MAX_TRANSCRIPT_CHARACTERS = 32_000
 _CONTEXT_TOKENS = 16384
 _OUTPUT_TOKENS = 1536
-
-
-class InferenceError(Exception):
-    """An inference failure whose message is safe to show without private content."""
-
-
-class AudioDurationError(InferenceError):
-    """The decoded audio exceeds the limit accepted for this recording."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +94,7 @@ async def _run_process(*arguments: str, timeout: float, label: str) -> None:
         raise InferenceError(f"{label} failed; check the input and local model installation.")
 
 
-def _check_wav(path: Path, max_duration: int) -> None:
+def _check_wav(path: Path, max_duration: int) -> float:
     """Check decoded duration and near-digital silence, without claiming full VAD."""
     try:
         with wave.open(str(path), "rb") as audio:
@@ -115,17 +109,17 @@ def _check_wav(path: Path, max_duration: int) -> None:
             if frame_count > max_duration * 16_000:
                 raise AudioDurationError(f"Audio exceeds the {max_duration}-second limit.")
             if frame_count == 0:
-                raise InferenceError("The audio is empty.")
+                raise NoClearSpeechError()
             peak = 0
             while data := audio.readframes(16_000):
                 samples = array("h", data)
                 if sys.byteorder != "little":
                     samples.byteswap()
                 peak = max(peak, max(abs(value) for value in samples))
-            # This intentionally detects only near-zero samples. Background noise
-            # and music can still confuse ASR; a VAD model is a separate improvement.
+            # Reject near-digital silence cheaply; a separate speech check follows.
             if peak < 16:
-                raise InferenceError("No audible speech was found; the recording appears silent.")
+                raise NoClearSpeechError()
+            return frame_count / 16_000
     except (OSError, EOFError, wave.Error, ValueError):
         raise InferenceError("Could not read the converted audio.") from None
 
@@ -170,6 +164,7 @@ class WhisperTranscriber:
         max_duration: int = 600,
         *,
         temporary_root: Path | None = None,
+        speech_detector: SpeechPresenceDetector | None = None,
     ) -> None:
         if (
             not math.isfinite(timeout)
@@ -183,6 +178,9 @@ class WhisperTranscriber:
         self.ffmpeg_binary = ffmpeg_binary
         self.timeout = timeout
         self.max_duration = max_duration
+        self.speech_detector = (
+            speech_detector if speech_detector is not None else SpeechPresenceDetector()
+        )
         self.temporary_root: Path | None = None
         if temporary_root is not None:
             root = Path(temporary_root).expanduser()
@@ -236,7 +234,8 @@ class WhisperTranscriber:
                 timeout=min(self.timeout, 60),
                 label="ffmpeg",
             )
-            await asyncio.to_thread(_check_wav, wav_path, duration_limit)
+            audio_seconds = await asyncio.to_thread(_check_wav, wav_path, duration_limit)
+            await self.speech_detector.check(wav_path, audio_seconds)
             await _run_process(
                 self.binary,
                 "-m",
