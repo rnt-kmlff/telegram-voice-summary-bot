@@ -24,6 +24,7 @@ from .inference import (
     Transcript,
     WhisperTranscriber,
 )
+from .speech_presence import SpeechPresenceDetector, verify_vad_model
 
 
 class _PrivateLogFilter(logging.Filter):
@@ -68,6 +69,7 @@ async def local_command(args, settings: Settings) -> None:
             binary=settings.whisper_binary,
             ffmpeg_binary=settings.ffmpeg_binary,
             max_duration=settings.max_duration,
+            speech_detector=SpeechPresenceDetector(settings.vad_model_path, settings.vad_binary),
         )
         transcript = await transcriber.transcribe(args.file, language=settings.whisper_language)
     if not transcript.text.strip():
@@ -96,7 +98,13 @@ async def doctor(settings: Settings) -> bool:
         "Whisper command": bool(shutil.which(settings.whisper_binary)),
         "FFmpeg command": bool(shutil.which(settings.ffmpeg_binary)),
         "Whisper model": settings.model_path.is_file(),
+        "Speech detector command": bool(shutil.which(settings.vad_binary)),
     }
+    try:
+        verify_vad_model(settings.vad_model_path)
+        checks["Verified speech detector model"] = True
+    except InferenceError:
+        checks["Verified speech detector model"] = False
     summarizer = OllamaSummarizer(settings.ollama_base_url, settings.ollama_model)
     try:
         # A metadata-only readiness check; never send a transcript to a missing model.

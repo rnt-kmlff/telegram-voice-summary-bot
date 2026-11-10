@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -547,3 +548,63 @@ def test_credit_only_result_can_be_audited_without_cleaned_text(store):
     assert result.transcript == ""
     assert result.raw_transcript == "Credit."
     assert result.state == "failed"
+
+
+@pytest.mark.parametrize("version", [0, 1, 2])
+def test_speech_version_requeue_clears_audit_and_respects_current_allowance(store, clock, version):
+    job, _ = enqueue(store, duration_limit=600)
+    store.next_job()
+    store.save_transcript(
+        job.id,
+        "clean",
+        "en",
+        raw_transcript="original",
+        removed_endings=("credit",),
+        speech_check_version=version,
+    )
+    store.complete(job.id, "clean", "en", "{}")
+    clock.now += 1
+    repeated, created = enqueue(
+        store, required_speech_check_version=1, duration_limit=300, message_id=30
+    )
+    assert not created and repeated.id == job.id
+    if version == 1:
+        assert repeated.state == "done"
+        assert repeated.duration_limit == 600 and repeated.transcript == "clean"
+    else:
+        assert repeated.state == "queued"
+        assert repeated.duration_limit == 300 and repeated.message_id == 30
+        assert (
+            repeated.transcript is repeated.raw_transcript is repeated.removed_endings_json is None
+        )
+        assert repeated.summary_json is None and repeated.speech_check_version == 0
+
+
+def test_old_cached_requeue_obeys_capacity_without_erasing_result(store):
+    job, _ = enqueue(store)
+    store.next_job()
+    store.complete(job.id, "old", "en", "{}")
+    enqueue(store, "busy")
+    with pytest.raises(QueueFull):
+        enqueue(store, max_pending=1, required_speech_check_version=1)
+    saved = store.get(job.id, 123, 123)
+    assert saved.state == "done" and saved.transcript == "old"
+
+
+def test_speech_version_migration_and_restart_preserve_ttl(tmp_path, clock):
+    directory = tmp_path / "data"
+    with closing(Store(directory, ttl_hours=1, clock=clock)) as store:
+        job, _ = enqueue(store)
+        store.next_job()
+        store.complete(job.id, "old", "en", "{}")
+        store._connection.execute("ALTER TABLE jobs DROP COLUMN speech_check_version")
+    with closing(Store(directory, ttl_hours=1, clock=clock)) as migrated:
+        assert migrated.get(job.id, 123, 123).speech_check_version == 0
+        enqueue(migrated, required_speech_check_version=1)
+        migrated.next_job()
+        migrated.save_transcript(job.id, "checked", "en", speech_check_version=1)
+        migrated.complete(job.id, "checked", "en", "{}")
+    with closing(Store(directory, ttl_hours=1, clock=clock)) as restarted:
+        assert restarted.get(job.id, 123, 123).speech_check_version == 1
+        clock.now += 3601
+        assert restarted.get(job.id, 123, 123) is None

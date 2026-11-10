@@ -155,3 +155,44 @@ async def test_text_only_summary_does_not_filter_user_supplied_text(monkeypatch,
     )
     assert summarizer.summarize.call_args.args[0].text == source
     assert "transcription_cleanup" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("missing", [None, "model", "command"])
+async def test_doctor_requires_detector_command_and_verified_model(
+    monkeypatch, tmp_path, capsys, missing
+):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    from voice_summary_bot import cli
+    from voice_summary_bot.config import Settings
+    from voice_summary_bot.errors import SpeechCheckUnavailableError
+
+    model = tmp_path / "whisper.bin"
+    model.touch()
+    settings = replace(Settings(), model_path=model)
+    monkeypatch.setattr(
+        cli.shutil,
+        "which",
+        lambda name: None if missing == "command" and name == settings.vad_binary else name,
+    )
+
+    def verify(path):
+        assert path == settings.vad_model_path
+        if missing == "model":
+            raise SpeechCheckUnavailableError()
+
+    monkeypatch.setattr(cli, "verify_vad_model", verify)
+    monkeypatch.setattr(cli, "OllamaSummarizer", lambda *a: SimpleNamespace(close=AsyncMock()))
+    client = httpx.AsyncClient
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"models": [{"name": settings.ollama_model}]})
+    )
+    monkeypatch.setattr(cli.httpx, "AsyncClient", lambda **kw: client(**kw, transport=transport))
+    assert await cli.doctor(settings) is (missing is None)
+    output = capsys.readouterr().out
+    if missing:
+        assert "MISSING" in output

@@ -24,6 +24,7 @@ from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from .config import Settings
+from .errors import NoClearSpeechError, SpeechCheckUnavailableError
 from .inference import (
     AudioDurationError,
     InferenceError,
@@ -32,6 +33,7 @@ from .inference import (
     Transcript,
     WhisperTranscriber,
 )
+from .speech_presence import SPEECH_CHECK_VERSION, SpeechPresenceDetector
 from .storage import Job, QueueFull, Store
 
 LOGGER = logging.getLogger(__name__)
@@ -354,6 +356,7 @@ class VoiceBot:
                 status_message_id=status.message_id,
                 max_pending=self.settings.max_pending_jobs,
                 duration_limit=duration_limit,
+                required_speech_check_version=SPEECH_CHECK_VERSION,
             )
         except QueueFull:
             await status.edit_text("The queue is full. Please forward this recording again later.")
@@ -445,6 +448,7 @@ class VoiceBot:
             transcript.language,
             raw_transcript=transcript.raw_text,
             removed_endings=transcript.removed_endings,
+            speech_check_version=SPEECH_CHECK_VERSION,
         )
         if not transcript.text.strip():
             self.store.fail(job.id)
@@ -489,6 +493,12 @@ class VoiceBot:
                 await self.process_job(application, job)
             except asyncio.CancelledError:
                 raise
+            except (NoClearSpeechError, SpeechCheckUnavailableError) as exc:
+                # A recovered attempt may still hold text produced before this gate.
+                self.store.fail(job.id, clear_transcript=True)
+                LOGGER.info("Recording speech check stopped (%s).", type(exc).__name__)
+                with contextlib.suppress(TelegramError):
+                    await self.edit_status(application, job, str(exc))
             except AudioDurationError:
                 self.store.fail(job.id)
                 accepted_limit = duration_label(min(job.duration_limit, self.settings.max_duration))
@@ -529,6 +539,9 @@ def run_bot(settings: Settings) -> None:
                 ffmpeg_binary=settings.ffmpeg_binary,
                 max_duration=settings.max_duration,
                 temporary_root=temporary_root,
+                speech_detector=SpeechPresenceDetector(
+                    settings.vad_model_path, settings.vad_binary
+                ),
             )
             summarizer = OllamaSummarizer(settings.ollama_base_url, settings.ollama_model)
             handlers = VoiceBot(settings, store, transcriber, summarizer)

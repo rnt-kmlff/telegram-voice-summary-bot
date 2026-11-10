@@ -65,9 +65,19 @@ def validate_install(repo: Path) -> None:
         os.environ.update(old_environment)
     if not settings.model_path.is_file():
         raise ServiceError("The configured Whisper model is missing; download it first.")
+    from voice_summary_bot.errors import SpeechCheckUnavailableError
+    from voice_summary_bot.speech_presence import verify_vad_model
+
+    try:
+        verify_vad_model(settings.vad_model_path)
+    except SpeechCheckUnavailableError:
+        raise ServiceError(
+            "The speech detector model is missing or unverified; download it first."
+        ) from None
     for label, command in (
         ("Whisper", settings.whisper_binary),
         ("FFmpeg", settings.ffmpeg_binary),
+        ("speech detector", settings.vad_binary),
     ):
         if shutil.which(command, path=SERVICE_PATH) is None:
             raise ServiceError(f"The configured {label} command is unavailable to the service.")

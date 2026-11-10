@@ -5,7 +5,9 @@ Forward an English or Russian voice message to your own Telegram bot. Get a conc
 ```mermaid
 flowchart LR
   A[Forward a voice message] --> B[Private Telegram bot]
-  B --> C[Whisper via whisper.cpp]
+  B --> S{Local speech check}
+  S -->|Speech detected| C[Whisper via whisper.cpp]
+  S -->|Too little speech| R[Please resend or send text]
   C --> D[Qwen3.5 via local Ollama]
   D --> E[Summary + full transcript]
   E --> B
@@ -16,6 +18,7 @@ flowchart LR
 - English/Russian voice notes and audio files, up to ten minutes and 20 MB.
 - Private chats restricted to an explicit user allowlist.
 - Local Apple Silicon speech recognition, with Qwen3.5 9B for summaries.
+- A lightweight local Silero check rejects recordings with too little detected speech before Whisper or Qwen runs.
 - Summaries condense the whole transcript with controlled rephrasing, removing filler and repetition. Explicitly requested translations are labeled as machine translations.
 - A conservative list removes distinctive Whisper subtitle-credit endings before summarization, with the unfiltered text and removal record retained locally for review.
 - A durable SQLite queue, one inference job at a time, and duplicate detection.
@@ -35,6 +38,7 @@ git clone https://github.com/rnt-kmlff/telegram-voice-summary-bot.git
 cd telegram-voice-summary-bot
 uv sync --locked
 bash scripts/download-whisper.sh
+uv run python scripts/download_vad.py
 ollama serve
 ```
 
@@ -89,13 +93,25 @@ Changing the limit affects future recordings. Already queued recordings retain t
 
 If processing fails, forward the message again to retry. If only summarization fails, the available transcript remains accessible. This initial version does not ingest chat histories, join groups, send messages to other people, or execute instructions spoken in a recording.
 
+### Speech-presence check
+
+Before transcription, the decoded audio passes through the CPU-only `whisper-vad-speech-segments` command from whisper.cpp and the small Silero v6.2.0 model. A recording needs at least **0.5 seconds of detected speech**, or **10% of its duration for clips shorter than five seconds**. This keeps short acknowledgements usable. Accepted recordings reach Whisper in full; detected intervals are not used to trim them.
+
+If too little speech is detected, the bot replies: **“No clear speech detected. Please resend the recording or send the message as text.”** No transcript or summary is produced. A missing/corrupt detector, invalid output or a timeout instead reports that the speech check is unavailable. There is no bypass or cloud fallback.
+
+Run `uv run python scripts/download_vad.py` once during setup. The download is pinned to a reviewed revision and SHA-256; the model is verified again before use and never downloaded while handling a recording. `VAD_MODEL_PATH` and `VAD_BINARY` can select local paths, but alternate model bytes are rejected. `voice-summary doctor` checks both dependencies. See the [design review](docs/speech-presence-review.md) for the exact pin and operating limits.
+
+Voice detection is not a transcription-confidence score: noise can resemble speech, and unusually short or quiet real speech may be missed. It cannot guarantee that Whisper will never hallucinate. The ending filter below remains a separate, narrow safeguard.
+
+On forwarding a recording again, completed results created before this check are requeued under the current duration limit; results with the current check version can be reused. Already queued/processing recordings retain their accepted limit. Old chat messages and downloaded transcripts are not rewritten. Failed attempts remain retryable and keep the existing local expiry policy.
+
 ### Known Whisper endings
 
 The editable literal list is [whisper_endings.txt](src/voice_summary_bot/whisper_endings.txt). It initially contains the confirmed Russian credits `Субтитры сделал DimaTorzok` and `Субтитры создавал DimaTorzok`. Matching ignores case, whitespace and common punctuation. Only complete trailing Whisper segments match, including a credit split across consecutive final segments; an ordinary segment stops the scan. Quoted credits, mentions in the middle, and credits embedded in a longer segment are preserved. Ordinary closings such as “Спасибо” and “Thank you for watching” are not on the list. Timestamps alone never cause removal.
 
 Cleaned text is used for Qwen and the transcript download. If cleanup changed it, the unfiltered transcript text and exact removed endings are stored in the same private job row (`raw_transcript` and `removed_endings_json`), survive a restart or summary failure, and expire with that job. They are not sent to Qwen or added to Telegram exports. A retry clears the prior audit before processing again. If cleanup leaves no text, the bot reports that no usable speech remains and skips summarization, while retaining the local audit until expiry.
 
-To extend the list, add a distinctive, verified credit on its own line, add synthetic regression cases, run the tests, and restart the bot. Broad phrases risk deleting actual speech. This is a narrow heuristic, not a general hallucination detector or voice-activity detector; even a listed credit could be intentionally spoken. Existing cached results and previously sent Telegram files are not rewritten.
+To extend the list, add a distinctive, verified credit on its own line, add synthetic regression cases, run the tests, and restart the bot. Broad phrases risk deleting actual speech. This is a narrow heuristic, not a general hallucination detector or voice-activity detector; even a listed credit could be intentionally spoken. Previously sent Telegram files are not rewritten; the speech-check cache rule above applies when a recording is forwarded again.
 
 ## Local use without Telegram
 

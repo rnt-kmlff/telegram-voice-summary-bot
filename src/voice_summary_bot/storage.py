@@ -32,6 +32,7 @@ class Job:
     duration_limit: int = 300
     raw_transcript: str | None = field(default=None, repr=False)
     removed_endings_json: str | None = field(default=None, repr=False)
+    speech_check_version: int = 0
 
 
 class Store:
@@ -86,6 +87,7 @@ class Store:
                     transcript TEXT,
                     raw_transcript TEXT,
                     removed_endings_json TEXT,
+                    speech_check_version INTEGER NOT NULL DEFAULT 0,
                     summary_json TEXT,
                     language TEXT,
                     created_at REAL NOT NULL,
@@ -121,6 +123,11 @@ class Store:
                 for column in ("raw_transcript", "removed_endings_json"):
                     if column not in columns:
                         self._connection.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
+                if "speech_check_version" not in columns:
+                    self._connection.execute(
+                        "ALTER TABLE jobs ADD COLUMN "
+                        "speech_check_version INTEGER NOT NULL DEFAULT 0"
+                    )
             self._private_files()
             self.purge()
         except BaseException:
@@ -221,16 +228,19 @@ class Store:
         status_message_id: int,
         max_pending: int = 10,
         duration_limit: int = 300,
+        required_speech_check_version: int = 0,
     ) -> tuple[Job, bool]:
         """Return the job and whether a new record was created.
 
-        Failed duplicates are requeued with fresh message IDs and duration limit,
-        and return False. Other duplicates retain their original allowance.
+        Failed or outdated completed duplicates are requeued with fresh message IDs
+        and duration limit, and return False. Other duplicates keep their allowance.
         """
         if max_pending < 1:
             raise ValueError("max_pending must be positive.")
         if type(duration_limit) is not int or not 1 <= duration_limit <= 600:
             raise ValueError("duration_limit must be an integer between 1 and 600 seconds.")
+        if type(required_speech_check_version) is not int or required_speech_check_version < 0:
+            raise ValueError("required_speech_check_version must be a nonnegative integer.")
         # Also expires a duplicate immediately, even between periodic purges.
         self.purge()
         with self._transaction():
@@ -239,7 +249,12 @@ class Store:
                 (user_id, file_unique_id),
             ).fetchone()
             existing = self._job(row)
-            if existing is not None and existing.state != "failed":
+            outdated = (
+                existing is not None
+                and existing.state == "done"
+                and existing.speech_check_version != required_speech_check_version
+            )
+            if existing is not None and existing.state != "failed" and not outdated:
                 return existing, False
             if self._pending_count() >= max_pending:
                 raise QueueFull("The processing queue is full. Try again later.")
@@ -249,6 +264,7 @@ class Store:
                     "UPDATE jobs SET chat_id = ?, message_id = ?, file_id = ?, "
                     "status_message_id = ?, state = 'queued', transcript = NULL, "
                     "raw_transcript = NULL, removed_endings_json = NULL, "
+                    "speech_check_version = 0, "
                     "summary_json = NULL, language = NULL, created_at = ?, updated_at = ?, "
                     "duration_limit = ? "
                     "WHERE id = ?",
@@ -313,20 +329,24 @@ class Store:
         *,
         raw_transcript: str | None = None,
         removed_endings: tuple[str, ...] = (),
+        speech_check_version: int = 0,
     ) -> None:
         """Save cleaned text and its local audit together, under the same job TTL."""
         if removed_endings and not raw_transcript:
             raise ValueError("Removed endings require an original transcript for the audit.")
+        if type(speech_check_version) is not int or speech_check_version < 0:
+            raise ValueError("speech_check_version must be a nonnegative integer.")
         self._maybe_purge()
         self._connection.execute(
             "UPDATE jobs SET transcript = ?, language = ?, raw_transcript = ?, "
-            "removed_endings_json = ?, updated_at = ? "
+            "removed_endings_json = ?, speech_check_version = ?, updated_at = ? "
             "WHERE id = ? AND state = 'processing'",
             (
                 transcript,
                 language,
                 raw_transcript,
                 json.dumps(removed_endings, ensure_ascii=False) if removed_endings else None,
+                speech_check_version,
                 self._clock(),
                 job_id,
             ),
@@ -340,10 +360,16 @@ class Store:
             (transcript, language, summary_json, self._clock(), job_id),
         )
 
-    def fail(self, job_id: str) -> None:
+    def fail(self, job_id: str, *, clear_transcript: bool = False) -> None:
         self._maybe_purge()
+        clear_result = (
+            ", transcript = NULL, raw_transcript = NULL, removed_endings_json = NULL, "
+            "summary_json = NULL, language = NULL, speech_check_version = 0"
+            if clear_transcript
+            else ""
+        )
         self._connection.execute(
-            "UPDATE jobs SET state = 'failed', updated_at = ? "
+            f"UPDATE jobs SET state = 'failed', updated_at = ?{clear_result} "
             "WHERE id = ? AND state IN ('queued', 'processing', 'done')",
             (self._clock(), job_id),
         )

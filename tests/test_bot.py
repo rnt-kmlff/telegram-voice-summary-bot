@@ -536,3 +536,91 @@ async def test_credit_only_result_is_not_summarized_but_audit_is_retained(setup)
     reply = app.bot.edit_message_text.call_args.kwargs
     assert "No usable speech" in reply["text"]
     assert reply["reply_markup"] is None
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+@pytest.mark.parametrize("recovered", [False, True])
+async def test_speech_rejection_worker_resend_without_summary_or_transcript(
+    setup, unavailable, recovered
+):
+    from voice_summary_bot.errors import NoClearSpeechError, SpeechCheckUnavailableError
+
+    settings, store, adapter = setup
+    job = enqueue(store)
+    if recovered:
+        store.next_job()
+        store.save_transcript(
+            job.id,
+            "stale attempt",
+            "en",
+            raw_transcript="old audit",
+            removed_endings=("credit",),
+            speech_check_version=1,
+        )
+        store.recover()
+    error = SpeechCheckUnavailableError() if unavailable else NoClearSpeechError()
+    adapter.transcriber.transcribe.side_effect = error
+    delivered = asyncio.Event()
+
+    async def download(destination):
+        destination.write_bytes(b"synthetic noisy input")
+
+    async def edited(**kwargs):
+        if kwargs["text"] == str(error):
+            delivered.set()
+
+    app = SimpleNamespace(
+        bot=SimpleNamespace(
+            get_file=AsyncMock(
+                return_value=SimpleNamespace(
+                    file_size=21, download_to_drive=AsyncMock(side_effect=download)
+                )
+            ),
+            edit_message_text=AsyncMock(side_effect=edited),
+        )
+    )
+    task = asyncio.create_task(adapter.worker(app))
+    try:
+        await asyncio.wait_for(delivered.wait(), timeout=2)
+        saved = store.get(job.id, 1, 1)
+        assert saved.state == "failed"
+        assert saved.transcript is saved.summary_json is saved.raw_transcript is None
+        assert saved.removed_endings_json is None
+        assert saved.speech_check_version == 0
+        adapter.summarizer.summarize.assert_not_awaited()
+        reply = app.bot.edit_message_text.call_args.kwargs
+        assert reply["text"] == str(error)
+        assert reply["reply_markup"] is None
+        assert not list((settings.data_dir / "audio-tmp").glob("voice-*"))
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    # Resending a failed file remains possible after either failure mode.
+    media = SimpleNamespace(duration=20, file_size=21, file_id="again", file_unique_id="unique")
+    await adapter.receive(update(voice=media), None)
+    assert store.get(job.id, 1, 1).state == "queued"
+
+
+@pytest.mark.parametrize("version", [0, 1])
+async def test_bot_requeues_only_completed_results_without_current_speech_check(setup, version):
+    from voice_summary_bot.speech_presence import SPEECH_CHECK_VERSION
+
+    _, store, adapter = setup
+    job = enqueue(store)
+    store.next_job()
+    store.save_transcript(job.id, "synthetic transcript", "en", speech_check_version=version)
+    summary = Summary(overview="synthetic summary", key_points=[], actions=[], uncertainties=[])
+    store.complete(job.id, "synthetic transcript", "en", summary.model_dump_json())
+    media = SimpleNamespace(duration=20, file_size=21, file_id="again", file_unique_id="unique")
+    event = update(voice=media)
+    event.effective_message.reply_text.return_value.message_id = 30
+    await adapter.receive(event, None)
+    saved = store.get(job.id, 1, 1)
+    if version == SPEECH_CHECK_VERSION:
+        assert saved.state == "done"
+        reply = event.effective_message.reply_text.return_value.edit_text
+        assert "synthetic summary" in str(reply.call_args)
+    else:
+        assert saved.state == "queued"
+        assert saved.transcript is saved.summary_json is None

@@ -84,7 +84,9 @@ def test_whisper_uses_native_json_schema_and_cleans_temporary_files(
 
     monkeypatch.setattr(inference, "_run_process", fake_process)
     transcript = asyncio.run(
-        WhisperTranscriber(model, temporary_root=temporary_root).transcribe(source)
+        WhisperTranscriber(
+            model, temporary_root=temporary_root, speech_detector=AsyncMock()
+        ).transcribe(source)
     )
     assert transcript == Transcript("Встреча в пятницу. Подтверди, пожалуйста.", "ru")
     ffmpeg_args = calls[0][0]
@@ -118,7 +120,7 @@ def test_temporary_audio_root_cannot_be_a_symlink(tmp_path):
 
 @pytest.mark.parametrize(
     ("duration", "silent", "message"),
-    [(1.1, False, "exceeds"), (0.05, True, "silent"), (0, True, "empty")],
+    [(1.1, False, "exceeds"), (0.05, True, "No clear speech"), (0, True, "No clear speech")],
 )
 def test_rejects_decoded_long_or_silent_audio_before_whisper(
     tmp_path, monkeypatch, duration, silent, message
@@ -169,7 +171,7 @@ def test_per_recording_limit_does_not_change_shared_transcriber(tmp_path, monkey
             )
 
     monkeypatch.setattr(inference, "_run_process", fake_process)
-    transcriber = WhisperTranscriber(model, max_duration=600)
+    transcriber = WhisperTranscriber(model, max_duration=600, speech_detector=AsyncMock())
     with pytest.raises(AudioDurationError):
         asyncio.run(transcriber.transcribe(source, max_duration=300))
     assert [args[0] for args in calls] == ["ffmpeg"]
@@ -702,3 +704,64 @@ def test_ollama_wall_clock_timeout():
             await summarizer.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+async def test_speech_rejection_prevents_whisper_and_cleans_audio(
+    tmp_path, monkeypatch, unavailable
+):
+    from voice_summary_bot.errors import NoClearSpeechError, SpeechCheckUnavailableError
+
+    model = tmp_path / "model"
+    model.touch()
+    (tmp_path / "input").touch()
+    calls, decoded = [], []
+    error_type = SpeechCheckUnavailableError if unavailable else NoClearSpeechError
+    detector = AsyncMock()
+    detector.check.side_effect = error_type()
+
+    async def ffmpeg(*arguments, **kwargs):
+        calls.append(arguments[0])
+        assert arguments[0] == "ffmpeg"
+        path = Path(arguments[-1])
+        decoded.append(path)
+        _write_wav(path, duration=12)
+
+    monkeypatch.setattr(inference, "_run_process", ffmpeg)
+    with pytest.raises(error_type):
+        await WhisperTranscriber(model, speech_detector=detector).transcribe(tmp_path / "input")
+    assert calls == ["ffmpeg"]
+    detector.check.assert_awaited_once_with(decoded[0], 12)
+    assert not decoded[0].parent.exists()
+
+
+async def test_speech_gate_runs_before_whisper_without_trimming(tmp_path, monkeypatch):
+    model = tmp_path / "model"
+    model.touch()
+    (tmp_path / "input").touch()
+    calls, original = [], []
+
+    async def check(path, duration):
+        calls.append("speech")
+        assert duration == 12
+        original.append(path.read_bytes())
+
+    detector = AsyncMock()
+    detector.check.side_effect = check
+
+    async def run(*arguments, **kwargs):
+        calls.append(arguments[0])
+        if arguments[0] == "ffmpeg":
+            _write_wav(Path(arguments[-1]), duration=12)
+        else:
+            assert Path(arguments[arguments.index("-f") + 1]).read_bytes() == original[0]
+            Path(arguments[arguments.index("-of") + 1]).with_suffix(".json").write_text(
+                json.dumps({"transcription": [{"text": "Please confirm tomorrow."}]})
+            )
+
+    monkeypatch.setattr(inference, "_run_process", run)
+    result = await WhisperTranscriber(model, speech_detector=detector).transcribe(
+        tmp_path / "input"
+    )
+    assert result.text == "Please confirm tomorrow."
+    assert calls == ["ffmpeg", "speech", "whisper-cli"]
